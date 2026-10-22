@@ -119,6 +119,8 @@ export const api = {
   takeBrowserDownloads: () => invoke<Incoming[]>("take_browser_downloads"),
   openFile: (id: number) => invoke<void>("open_file", { id }),
   showInFolder: (id: number) => invoke<void>("show_in_folder", { id }),
+  /** PNG bytes. */
+  fileIcon: (id: number, size: number) => invoke<ArrayBuffer>("file_icon", { id, size }),
 };
 
 export function onEngineEvent(handler: (event: EngineEvent) => void): Promise<UnlistenFn> {

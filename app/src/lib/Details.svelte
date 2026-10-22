@@ -40,7 +40,14 @@
     <dd>
       {STATUS_LABELS[item.status]}
       {#if item.status === "downloading"}· {item.activeConnections} connections{/if}
-      {#if !item.resumable}· <span class="warn">no resume support</span>{/if}
+    </dd>
+    <dt>Resume</dt>
+    <dd>
+      {#if item.resumable}
+        Supported · pausing keeps what's downloaded
+      {:else}
+        <span class="warn">Not supported</span> · pausing or a lost connection starts over
+      {/if}
     </dd>
     <dt>Queue</dt>
     <dd>{downloads.queueName(item.queue)}</dd>

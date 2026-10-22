@@ -4,6 +4,7 @@
   import AddDialog from "./lib/AddDialog.svelte";
   import { api, type Incoming, MAIN_QUEUE, onBrowserDownload, type Queue } from "./lib/api";
   import Details from "./lib/Details.svelte";
+  import FileIcon from "./lib/FileIcon.svelte";
   import {
     downloads,
     eta,
@@ -14,7 +15,7 @@
     type Item,
     type View,
   } from "./lib/downloads.svelte";
-  import { bytes, duration, extension, kind } from "./lib/format";
+  import { bytes, duration } from "./lib/format";
   import Icon from "./lib/Icon.svelte";
   import QueueDialog from "./lib/QueueDialog.svelte";
   import RemoveDialog from "./lib/RemoveDialog.svelte";
@@ -280,7 +281,6 @@
         <span class="num">Time left</span>
       </div>
       {#each visible as item (item.id)}
-        {@const ext = extension(item.fileName)}
         {@const pct = percent(item)}
         {@const left = eta(item)}
         <!-- Keyboard selection is handled by the window shortcuts. -->
@@ -295,8 +295,13 @@
           ondblclick={() => activate(item)}
         >
           <span class="name">
-            <span class="badge {kind(ext)}">{ext.slice(0, 4) || "FILE"}</span>
+            <FileIcon {item} />
             <span class="text" title={item.fileName}>{item.fileName}</span>
+            {#if !item.resumable && item.status !== "completed"}
+              <span class="no-resume" title="The server doesn't support resuming. Pausing restarts this download from the beginning.">
+                <Icon name="alert" size={14} />
+              </span>
+            {/if}
           </span>
           <span class="muted">{item.total === null ? "—" : bytes(item.total)}</span>
           <span class="progress {item.status}">

@@ -9,6 +9,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bridge;
+mod icons;
 
 use std::path::PathBuf;
 
@@ -18,7 +19,7 @@ use blazer_core::{
 };
 use bridge::{Bridge, Incoming};
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, ipc::Response};
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -183,6 +184,20 @@ async fn show_in_folder(
     }
 }
 
+/// The system icon for the download's file type, or for the file itself once it has finished,
+/// as PNG bytes.
+#[tauri::command]
+async fn file_icon(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    id: DownloadId,
+    size: u16,
+) -> CmdResult<Response> {
+    let record = engine.get(id).map_err(message)?;
+    let png = icons::png(&app, &record, size.clamp(16, 256)).await.map_err(|e| format!("{e:#}"))?;
+    Ok(Response::new(png))
+}
+
 /// Shares its state with the `blazer` CLI. redb allows one process at a time, so the CLI cannot
 /// run while the app is open.
 fn db_path() -> anyhow::Result<PathBuf> {
@@ -256,6 +271,7 @@ fn main() {
             take_browser_downloads,
             open_file,
             show_in_folder,
+            file_icon,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start InternetBlazer")
