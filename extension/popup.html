@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>InternetBlazer</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <img src="icons/64.png" alt="" width="24" height="24" />
+      <h1>InternetBlazer</h1>
+    </header>
+
+    <p id="status" class="status" role="status"><span class="dot"></span><span id="status-text">Checking…</span></p>
+
+    <div id="error" class="error" role="alert" hidden>
+      <p id="error-text"></p>
+      <button id="dismiss" type="button">Dismiss</button>
+    </div>
+
+    <div id="access" class="notice" hidden>
+      <p>Allow access to sites so downloads that need you to be signed in work in the app.</p>
+      <button id="grant" type="button" class="primary">Allow access</button>
+    </div>
+
+    <label class="check">
+      <input id="enabled" type="checkbox" />
+      Take over browser downloads
+    </label>
+
+    <label class="types">
+      <span>File types to take over</span>
+      <textarea id="file-types" rows="4" spellcheck="false"></textarea>
+    </label>
+    <p class="hint">
+      Right-click a link and choose “Download with InternetBlazer” to send any file. Downloads in
+      private windows stay in the browser.
+    </p>
+
+    <script src="common.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

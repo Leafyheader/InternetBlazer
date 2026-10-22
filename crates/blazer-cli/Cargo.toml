@@ -1,0 +1,19 @@
+[package]
+name = "blazer-cli"
+description = "Command-line interface for the InternetBlazer download engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blazer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+blazer-core.workspace = true
+clap.workspace = true
+dirs.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing-subscriber.workspace = true

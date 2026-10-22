@@ -1,0 +1,19 @@
+[package]
+name = "blazer-host"
+description = "Native messaging host that connects the InternetBlazer browser extension to the app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blazer-host"
+path = "src/main.rs"
+
+[dependencies]
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
