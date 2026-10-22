@@ -8,7 +8,9 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+fastrand.workspace = true
 futures-util.workspace = true
+httpdate.workspace = true
 parking_lot.workspace = true
 percent-encoding.workspace = true
 redb.workspace = true
@@ -20,6 +22,9 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

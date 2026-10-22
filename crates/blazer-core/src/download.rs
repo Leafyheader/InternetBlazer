@@ -2,9 +2,11 @@
 
 use std::{
     fs::File,
+    io,
+    path::Path,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,13 +21,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    engine::{Inner, MAX_CONNECTIONS},
+    engine::{Config, Inner, MAX_CONNECTIONS},
     error::{Error, Result},
     filename, fsio,
     limit::RateLimiter,
     probe,
     segment::{Claim, Plan},
-    types::{self, DownloadId, DownloadRecord, Event, Progress, Status},
+    sniff,
+    types::{self, DownloadId, DownloadRecord, Event, Progress, Retry, Status},
 };
 
 /// Weight of the newest sample in the smoothed speed.
@@ -34,6 +37,8 @@ const SPEED_SMOOTHING: f64 = 0.3;
 const MAX_BACKOFF_SHIFT: u32 = 5;
 /// Longest server-requested `Retry-After` delay that is honored.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// How long a finished range may take to end its response.
+const END_CHECK: Duration = Duration::from_secs(2);
 
 /// State shared by the connection workers of one download.
 struct Shared {
@@ -43,6 +48,8 @@ struct Shared {
     /// Sent as `If-Range`, so a changed file yields a full 200 response instead of
     /// mismatched bytes.
     validator: Option<String>,
+    /// The size the download expects, which ranged responses must agree with.
+    total: Option<u64>,
     ranged: bool,
     plan: Mutex<Plan>,
     file: Arc<File>,
@@ -55,6 +62,13 @@ struct Shared {
     /// Workers still running.
     workers: AtomicUsize,
     connections: AtomicUsize,
+    /// Bytes received so far, counted before they are written, so that slow progress shows
+    /// before a write buffer fills.
+    received: AtomicU64,
+    /// Connections waiting for a speed limit, which is no reason to call the download stalled.
+    throttled: AtomicUsize,
+    /// Why a connection last failed. The reporter clears it once data arrives again.
+    trouble: Mutex<Option<String>>,
     max_retries: u32,
     retry_delay: Duration,
     write_buffer: usize,
@@ -77,24 +91,70 @@ pub(crate) async fn run(
             return;
         }
     };
-    match execute(&inner, &mut record, &cancel, limiter).await {
+    let before = record.downloaded();
+    let previous = record.retry.take();
+    let mut retry_in = None;
+    let mut result = execute(&inner, &mut record, &cancel, limiter.clone()).await;
+    if matches!(result, Err(Error::RangeOverflow)) {
+        // Some CDNs give byte ranges the size of a compressed copy while sending the real file.
+        // A plain request for the whole file, which such servers get right, is the way out.
+        tracing::warn!(%id, "server's byte ranges are unreliable; downloading in one piece");
+        record.resumable = false;
+        record.total = None;
+        record.segments.clear();
+        result = execute(&inner, &mut record, &cancel, limiter).await;
+    }
+    match result {
         Ok(true) => {
             record.status = Status::Completed;
             record.completed_at = Some(types::now());
         }
-        Ok(false) => record.status = Status::Paused,
+        Ok(false) => {
+            record.status = Status::Paused;
+            // Stopped by the engine shutting down, not by someone pausing it.
+            record.interrupted = inner.closed.is_cancelled();
+        }
         Err(e) => {
-            tracing::warn!(%id, "download failed: {e}");
-            record.status = Status::Failed;
             record.error = Some(e.to_string());
+            // An attempt that got somewhere starts the count over.
+            let attempt = match previous {
+                Some(p) if record.downloaded() <= before => p.attempt + 1,
+                _ => 1,
+            };
+            if e.is_retryable() && attempt <= inner.config.auto_retries {
+                let delay = retry_delay(&inner.config, attempt, e.retry_after());
+                tracing::info!(%id, "retrying in {delay:?} (attempt {attempt}) after: {e}");
+                record.status = Status::Retrying;
+                let retry = Retry { attempt, at: types::now() + delay.as_secs() };
+                record.retry = Some(retry);
+                retry_in = Some((retry, delay));
+            } else {
+                tracing::warn!(%id, "download failed: {e}");
+                record.status = Status::Failed;
+            }
         }
     }
     if let Err(e) = inner.finish(&mut record) {
         tracing::error!(%id, "failed to save download: {e}");
     }
     inner.emit(Event::StatusChanged { id, status: record.status, error: record.error.clone() });
+    if let Some((retry, delay)) = retry_in {
+        inner.retry_later(id, retry, delay);
+    }
     // Its slot in the queue is free now.
     inner.dispatch();
+}
+
+/// Waits longer after each failed attempt, up to a limit, and longer still if the server asks.
+fn retry_delay(cfg: &Config, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    let backoff = cfg.auto_retry_delay.saturating_mul(1 << (attempt - 1).min(16));
+    jitter(backoff.min(cfg.max_auto_retry_delay)).max(retry_after.unwrap_or_default())
+}
+
+/// Spreads retries over ±20% of `delay`, so connections and downloads that failed together do
+/// not all come back at the same moment.
+fn jitter(delay: Duration) -> Duration {
+    delay.mul_f64(fastrand::f64().mul_add(0.4, 0.8))
 }
 
 /// Returns `Ok(true)` once complete and `Ok(false)` when paused.
@@ -112,7 +172,16 @@ async fn execute(
 
     let part = record.part_path();
     let started = record.segments.iter().any(|s| s.downloaded > 0);
-    let resume = started && record.resumable && part.exists();
+    // A fresh download sets the length of the file to the full size up front, so any other
+    // length means someone else changed it, and the progress cannot be trusted.
+    let part_len = std::fs::metadata(&part).ok().map(|m| m.len());
+    let resume = started && record.resumable && part_len.is_some() && part_len == record.total;
+    if started && !resume {
+        tracing::info!(id = %record.id, "partial data unusable; starting over");
+    }
+    if let Some(total) = record.total {
+        check_space(record, &part, total)?;
+    }
     if resume {
         let info = tokio::select! {
             info = probe::probe(&inner.client, &record.url, &record.headers) => info?,
@@ -146,6 +215,7 @@ async fn execute(
         url: record.url.clone(),
         headers: record.headers.clone(),
         validator: probe::if_range(record.etag.as_deref(), record.last_modified.as_deref()),
+        total: record.total,
         ranged,
         plan: Mutex::new(plan),
         file: Arc::new(file),
@@ -155,6 +225,9 @@ async fn execute(
         fatal: Mutex::new(None),
         workers: AtomicUsize::new(worker_count),
         connections: AtomicUsize::new(0),
+        received: AtomicU64::new(0),
+        throttled: AtomicUsize::new(0),
+        trouble: Mutex::new(None),
         max_retries: cfg.max_retries,
         retry_delay: cfg.retry_delay,
         write_buffer: cfg.write_buffer,
@@ -188,13 +261,22 @@ async fn execute(
         record.total = Some(plan.downloaded());
     }
     // Also closes the file, which Windows requires before the rename below.
-    tokio::task::spawn_blocking(move || file.sync_all()).await.map_err(Error::internal)??;
+    let len = tokio::task::spawn_blocking(move || {
+        file.sync_all()?;
+        file.metadata().map(|m| m.len())
+    })
+    .await
+    .map_err(Error::internal)??;
 
     if let Some(e) = fatal.into_inner() {
         return Err(e);
     }
     if complete {
-        finalize(record)?;
+        let expected = record.total.unwrap_or(len);
+        if len != expected {
+            return Err(Error::WrongSize { expected, actual: len });
+        }
+        finalize(inner, record)?;
         return Ok(true);
     }
     if cancel.is_cancelled() {
@@ -203,15 +285,48 @@ async fn execute(
     Err(last_error.unwrap_or(Error::Incomplete))
 }
 
-/// Moves the finished `.part` file to its final name, picking a new name if one appeared there
-/// in the meantime.
-fn finalize(record: &mut DownloadRecord) -> Result<()> {
-    let part = record.part_path();
-    if record.path().exists() {
-        record.file_name = filename::unique(&record.dir, &record.file_name, |p| p.exists());
+/// Fails early when the rest of the download cannot fit on the disk. The `.part` file is
+/// sparse, so the space it will need is not taken up front. Whatever it takes already counts as
+/// available: it is either kept or freed by starting over.
+fn check_space(record: &DownloadRecord, part: &Path, total: u64) -> Result<()> {
+    let needed = total.saturating_sub(fsio::allocated_size(part));
+    match fsio::available_space(&record.dir) {
+        Ok(available) if available < needed => Err(Error::NoSpace { needed, available }),
+        Ok(_) => Ok(()),
+        // Some network drives do not say; the write fails clearly enough if it comes to that.
+        Err(e) => {
+            tracing::debug!(id = %record.id, "could not check free disk space: {e}");
+            Ok(())
+        }
     }
-    std::fs::rename(part, record.path())?;
-    Ok(())
+}
+
+/// Moves the finished `.part` file to its final name, never over another file: if one took the
+/// name in the meantime, it picks a new one. The finished progress and the name are saved
+/// before the rename, so that after a crash right behind it, opening the engine recognizes the
+/// download as complete.
+///
+/// A name without an extension gets one from the file's first bytes, if they tell the type, so
+/// the file opens with the right program.
+fn finalize(inner: &Inner, record: &mut DownloadRecord) -> Result<()> {
+    let part = record.part_path();
+    if !sniff::has_extension(&record.file_name) {
+        match sniff::head(&part).map(|head| sniff::extension(&head)) {
+            Ok(Some(ext)) => record.file_name = format!("{}.{ext}", record.file_name),
+            Ok(None) => {}
+            Err(e) => tracing::debug!(id = %record.id, "could not read the file's type: {e}"),
+        }
+    }
+    loop {
+        if record.path().exists() {
+            record.file_name = filename::unique(&record.dir, &record.file_name, |p| p.exists());
+        }
+        inner.save_running(record)?;
+        match fsio::rename_new(&part, &record.path()) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            result => return Ok(result?),
+        }
+    }
 }
 
 /// One connection: claims segments and downloads them until no work is left.
@@ -238,12 +353,14 @@ async fn worker_loop(sh: &Shared) -> Result<Exit> {
         }
         let Some(claim) = sh.plan.lock().claim() else { return Ok(Exit::Finished) };
         let result = fetch(sh, claim, &mut buf, &mut failures).await;
+        // Such as a server found out on the last bytes, which must not pass as complete.
+        let fatal = matches!(&result, Err(e) if !e.is_retryable());
         let complete = {
             let mut plan = sh.plan.lock();
             plan.release(claim.idx);
             plan.is_complete()
         };
-        if complete {
+        if complete && !fatal {
             // Wakes connections sleeping before a retry, so the download ends now.
             sh.stop.cancel();
             return Ok(Exit::Finished);
@@ -263,12 +380,11 @@ async fn worker_loop(sh: &Shared) -> Result<Exit> {
             }
             Err(e) if e.is_retryable() && failures < sh.max_retries => {
                 failures += 1;
+                *sh.trouble.lock() = Some(e.to_string());
                 let backoff = sh.retry_delay * (1 << (failures - 1).min(MAX_BACKOFF_SHIFT));
-                let delay = match &e {
-                    Error::Throttled { retry_after: Some(after), .. } => {
-                        (*after).min(MAX_RETRY_AFTER)
-                    }
-                    _ => backoff,
+                let delay = match e.retry_after() {
+                    Some(after) => after.min(MAX_RETRY_AFTER),
+                    None => jitter(backoff),
                 };
                 tracing::debug!("retrying in {delay:?} after: {e}");
                 tokio::select! {
@@ -308,9 +424,14 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
             StatusCode::OK => return Err(Error::RangeIgnored),
             status => return Err(Error::from_response(status, resp.headers())),
         }
-        if let Some(start) = probe::content_range(resp.headers()).and_then(|r| r.start)
-            && start != claim.from
-        {
+        // Bytes from the wrong place, or from a file of another size, would corrupt the file.
+        let Some(range) = probe::content_range(resp.headers()) else {
+            return Err(Error::MalformedRange);
+        };
+        if range.total.is_some() && range.total != sh.total {
+            return Err(Error::RemoteChanged);
+        }
+        if range.start != Some(claim.from) {
             return Err(Error::RangeIgnored);
         }
     } else if !status.is_success() {
@@ -320,6 +441,10 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
     let _connection = ConnectionGuard::new(&sh.connections);
     let mut stream = resp.bytes_stream();
     let mut offset = claim.from;
+    // What this response may hold. The claim can shrink while it runs, when another
+    // connection takes over its end, but the request cannot.
+    let requested = claim.end - claim.from;
+    let mut body = 0u64;
     buf.clear();
     loop {
         let next = tokio::select! {
@@ -332,10 +457,15 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
         };
         match next {
             Some(Ok(chunk)) => {
+                body += chunk.len() as u64;
+                if sh.ranged && body > requested {
+                    return Err(Error::RangeOverflow);
+                }
                 let (take, done) = sh.plan.lock().reserve(claim.idx, chunk.len());
                 buf.extend_from_slice(&chunk[..take]);
                 if take > 0 {
                     *failures = 0;
+                    sh.received.fetch_add(take as u64, Ordering::Relaxed);
                 }
                 if done || buf.len() >= sh.write_buffer {
                     offset = flush(sh, claim.idx, offset, buf).await?;
@@ -346,6 +476,9 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
                 };
                 if done || stopped {
                     flush(sh, claim.idx, offset, buf).await?;
+                    if done && sh.ranged && body == requested {
+                        return check_ended(sh, &mut stream).await;
+                    }
                     return Ok(());
                 }
             }
@@ -368,10 +501,30 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
     }
 }
 
+/// After all the bytes a range asked for, the response must end. A server that sends more
+/// gives byte ranges of a different file than it serves.
+async fn check_ended<S, T, E>(sh: &Shared, stream: &mut S) -> Result<()>
+where
+    S: futures_util::Stream<Item = std::result::Result<T, E>> + Unpin,
+    T: AsRef<[u8]>,
+{
+    let next = tokio::select! {
+        next = time::timeout(END_CHECK, stream.next()) => next,
+        () = sh.stop.cancelled() => return Ok(()),
+    };
+    match next {
+        Ok(Some(Ok(chunk))) if !chunk.as_ref().is_empty() => Err(Error::RangeOverflow),
+        // The end, a connection problem after all the data, or a server that keeps the
+        // connection open: the data itself is complete either way.
+        _ => Ok(()),
+    }
+}
+
 impl Shared {
     /// Waits as long as the speed limits require after receiving `n` bytes.
     async fn throttle(&self, n: usize) {
         if n > 0 {
+            let _throttled = ConnectionGuard::new(&self.throttled);
             self.inner.speed_limit.take(n).await;
             self.limiter.take(n).await;
         }
@@ -409,6 +562,8 @@ async fn report(
     let mut last_checkpoint = Instant::now();
     let mut last_sample = (Instant::now(), shared.plan.lock().downloaded());
     let mut speed = 0.0;
+    let mut received = 0;
+    let mut last_data = Instant::now();
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -428,12 +583,22 @@ async fn report(
             };
         }
         last_sample = (now, downloaded);
+        let now_received = shared.received.load(Ordering::Relaxed);
+        if now_received != received || shared.throttled.load(Ordering::Relaxed) > 0 {
+            received = now_received;
+            last_data = now;
+            // Data flows again, so whatever went wrong before is over.
+            *shared.trouble.lock() = None;
+        }
+        let stalled = now.duration_since(last_data) >= cfg.stall_after;
         inner.emit(Event::Progress(Progress {
             id: record.id,
             downloaded,
             total: record.total,
             speed: speed as u64,
             connections: shared.connections.load(Ordering::Relaxed),
+            stalled,
+            problem: if stalled { shared.trouble.lock().clone() } else { None },
             segments: segments.clone(),
         }));
 

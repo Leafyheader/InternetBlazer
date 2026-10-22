@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use blazer_core::{
-    Config, DownloadId, DownloadRecord, Engine, NewDownload, Queue, QueueId, Settings,
+    Config, DownloadId, DownloadRecord, Engine, LinkInfo, NewDownload, Queue, QueueId, Settings,
 };
 use bridge::{Bridge, Incoming};
 use serde::Deserialize;
@@ -59,6 +59,22 @@ fn default_dir() -> Option<PathBuf> {
     dirs::download_dir()
 }
 
+/// Size and name of what a link points to, for the add dialog to show before downloading.
+#[tauri::command]
+async fn inspect_link(
+    engine: State<'_, Engine>,
+    url: String,
+    headers: Vec<(String, String)>,
+) -> CmdResult<LinkInfo> {
+    engine.inspect(url.trim(), &headers).await.map_err(message)
+}
+
+/// `None` when the disk does not say, such as some network drives.
+#[tauri::command]
+async fn free_space(dir: PathBuf) -> Option<u64> {
+    blazer_core::free_space(&dir).ok()
+}
+
 #[tauri::command]
 async fn add_download(engine: State<'_, Engine>, request: AddRequest) -> CmdResult<DownloadId> {
     let mut new = NewDownload::new(request.url.trim(), request.dir);
@@ -86,6 +102,11 @@ async fn pause_download(engine: State<'_, Engine>, id: DownloadId) -> CmdResult<
 #[tauri::command]
 async fn restart_download(engine: State<'_, Engine>, id: DownloadId) -> CmdResult<()> {
     engine.restart(id).await.map_err(message)
+}
+
+#[tauri::command]
+async fn set_download_url(engine: State<'_, Engine>, id: DownloadId, url: String) -> CmdResult<()> {
+    engine.set_url(id, &url).await.map_err(message)
 }
 
 #[tauri::command]
@@ -243,6 +264,13 @@ fn main() {
                 .with_context(|| format!("opening {}", db.display()))?;
             forward_events(app.handle().clone(), &engine);
             tauri::async_runtime::spawn(engine.clone().run_scheduler());
+            // Picks up where the app left off when it quit or crashed.
+            let resume = engine.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = resume.resume_interrupted() {
+                    tracing::error!("resuming interrupted downloads: {e}");
+                }
+            });
             app.manage(engine);
             app.manage(Bridge::default());
             bridge::serve(app.handle().clone());
@@ -253,10 +281,13 @@ fn main() {
             list_downloads,
             get_download,
             default_dir,
+            inspect_link,
+            free_space,
             add_download,
             start_download,
             pause_download,
             restart_download,
+            set_download_url,
             remove_download,
             set_download_queue,
             set_download_speed_limit,

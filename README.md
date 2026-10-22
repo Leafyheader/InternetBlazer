@@ -7,11 +7,17 @@ A fast, open-source, cross-platform download manager written in Rust: an IDM alt
 ## Features (engine)
 
 - **Segmented downloads.** Parallel HTTP range requests, with dynamic re-splitting: when a connection finishes, it takes half of the largest remaining segment, so no connection sits idle near the end.
-- **Crash-safe resume.** Progress is checkpointed every second: data is flushed to disk first, then the progress is recorded. A crash or power loss can only lose the last second of progress, never corrupt the file.
+- **Crash-safe resume.** Progress is checkpointed every second: data is flushed to disk first, then the progress is recorded, so the record never claims bytes that are not on disk. A crash or power loss loses at most the last second of progress. (This relies on the disk really writing data when asked to, as disks normally do.) When the app opens again, it checks the partial file: if its size no longer matches, the download starts over instead of resuming into the wrong data. A download that finished just before a crash is recognized as complete.
+- **Safe finish.** A download is written to a `.part` file and renamed when complete, never over an existing file. Its size is checked before it counts as complete.
+- **Checked responses.** Every partial response must say which bytes it holds and match the expected file size, or the download stops instead of writing misplaced data. A server whose ranges hold more data than they claim, as some CDNs do, is downloaded in one piece instead.
+- **Automatic retries.** After a temporary failure, such as a lost connection or a server error, a download waits and tries again by itself, for about an hour with growing pauses, and shows when the next try is. A short drop is bridged by the connections themselves; the list then shows "Reconnecting…" and why, rather than a frozen progress bar. Errors that retrying cannot fix, such as a missing file, fail right away with a message that says what to do.
+- **New address, same progress.** When a link expires, give the download a fresh one. It keeps its progress if the new link serves the same file.
+- **Disk space check.** A download that cannot fit on the disk fails before it starts, saying how much space it needs.
 - **Change detection.** `If-Range` and ETag/Last-Modified checks stop a resumed download from mixing two versions of a file.
-- **Polite to servers.** On HTTP 429/503 it sheds connections and honors `Retry-After`, instead of hammering the server until the IP gets blocked.
+- **Polite to servers.** On HTTP 429/503 it sheds connections and honors `Retry-After`, instead of hammering the server until the IP gets blocked. Retries are spread out slightly at random, so connections that failed together don't all come back at once.
 - **Fallbacks.** Single-stream download for servers without range support or without a known size.
 - **Safe file names.** Server-supplied names are sanitized, and a unique `name (1).ext` is picked when the name is already taken.
+- **File type detection.** A file sent without an extension gets one from its first bytes ("magic bytes"), such as `.mp4`, `.flv`, `.zip` or `.pdf`, so it opens with the right program.
 - **Queues.** Started downloads wait in a queue that runs a set number at a time, oldest first. You can add your own queues and move downloads between them.
 - **Scheduler.** A queue can start and stop at set times on chosen weekdays (local time), for example overnight. A stop time at or before the start time means the next day. Schedules run only while the desktop app is open.
 - **Speed limits.** One limit for all downloads together, plus an optional limit per download. Both can be changed while downloads run.
@@ -47,7 +53,7 @@ npm run tauri build -- --no-bundle         # release executable in target/releas
 npm run check                              # type-check the frontend
 ```
 
-The app and the CLI share one download list, stored in your local app data folder. Only one of them can have it open at a time. Starting the app while it runs brings its window to the front.
+The app and the CLI share one download list, stored in your local app data folder. Only one of them can have it open at a time. Starting the app while it runs brings its window to the front. Downloads that were running or queued when the app last quit or crashed start again when it opens. The CLI never starts them on its own.
 
 The sidebar lists the queues: select one to start, stop or configure it. "Move to queue" in the toolbar moves the selected downloads. The speed limit for all downloads is in the status bar, and a single download's limit is in its details.
 
@@ -77,6 +83,7 @@ If a download cannot reach the app, the browser downloads it after all and the t
 ```sh
 blazer get <URL> [-d DIR] [-o NAME] [-c CONNECTIONS] [-l LIMIT]   # Ctrl+C pauses
 blazer list
+blazer set-url <ID> <URL>                   # a fresh link for the same file; keeps progress
 blazer limit [RATE|off]                     # e.g. 500K or 2M; shared with the app
 blazer resume <ID>
 blazer restart <ID>

@@ -15,13 +15,21 @@ export interface Item extends DownloadRecord {
   speed: number;
   /** Connections currently receiving data. */
   activeConnections: number;
+  /** While downloading: nothing has arrived for a few seconds. */
+  stalled: boolean;
+  /** While stalled: why connections last failed. */
+  problem: string | null;
 }
 
 export type Filter = "all" | "active" | "paused" | "completed" | "failed";
 
 export const FILTERS: { id: Filter; label: string; matches: (s: Status) => boolean }[] = [
   { id: "all", label: "All downloads", matches: () => true },
-  { id: "active", label: "Downloading", matches: (s) => s === "downloading" || s === "queued" },
+  {
+    id: "active",
+    label: "Downloading",
+    matches: (s) => s === "downloading" || s === "queued" || s === "retrying",
+  },
   { id: "paused", label: "Paused", matches: (s) => s === "paused" },
   { id: "completed", label: "Completed", matches: (s) => s === "completed" },
   { id: "failed", label: "Failed", matches: (s) => s === "failed" },
@@ -46,6 +54,8 @@ function toItem(record: DownloadRecord, previous?: Item): Item {
     downloaded,
     speed: running ? (previous?.speed ?? 0) : 0,
     activeConnections: running ? (previous?.activeConnections ?? 0) : 0,
+    stalled: running && (previous?.stalled ?? false),
+    problem: running ? (previous?.problem ?? null) : null,
   };
 }
 
@@ -105,6 +115,8 @@ class Downloads {
             item.total = event.total;
             item.speed = event.speed;
             item.activeConnections = event.connections;
+            item.stalled = event.stalled;
+            item.problem = event.problem;
             item.segments = event.segments;
             break;
           }
@@ -116,6 +128,8 @@ class Downloads {
             if (event.status !== "downloading") {
               item.speed = 0;
               item.activeConnections = 0;
+              item.stalled = false;
+              item.problem = null;
             }
             // Picks up what changed besides the status, such as the size after a restart.
             this.refresh(event.id);
@@ -124,6 +138,11 @@ class Downloads {
           case "updated": {
             const item = this.items[event.id];
             if (!item) break;
+            if (item.status !== "downloading") {
+              const { type: _, ...record } = event;
+              this.items[event.id] = toItem(record, item);
+              break;
+            }
             // Only the settings are news; the stored progress of a running download lags.
             item.queue = event.queue;
             item.speedLimit = event.speedLimit;
@@ -166,7 +185,14 @@ export function eta(item: Item): number | null {
 export const STATUS_LABELS: Record<Status, string> = {
   queued: "Queued",
   downloading: "Downloading",
+  retrying: "Retrying",
   paused: "Paused",
   completed: "Completed",
   failed: "Failed",
 };
+
+/** Seconds until the next automatic retry, or null when none is pending. */
+export function retryIn(item: Item, now: number): number | null {
+  if (item.status !== "retrying" || !item.retry) return null;
+  return Math.max(0, item.retry.at - now);
+}

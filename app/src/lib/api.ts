@@ -4,7 +4,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-export type Status = "queued" | "downloading" | "paused" | "completed" | "failed";
+export type Status = "queued" | "downloading" | "retrying" | "paused" | "completed" | "failed";
+
+/** An automatic retry after a temporary failure. */
+export interface Retry {
+  /** Counts from 1. */
+  attempt: number;
+  /** Unix seconds. */
+  at: number;
+}
 
 export interface Segment {
   start: number;
@@ -29,6 +37,9 @@ export interface DownloadRecord {
   segments: Segment[];
   status: Status;
   error: string | null;
+  retry: Retry | null;
+  /** Running when the app last quit or crashed; the app resumes these as it starts. */
+  interrupted: boolean;
   /** Unix seconds. */
   addedAt: number;
   completedAt: number | null;
@@ -41,7 +52,18 @@ export interface Progress {
   /** Bytes per second. */
   speed: number;
   connections: number;
+  /** Nothing has arrived for a few seconds, and not because of a speed limit. */
+  stalled: boolean;
+  /** While stalled: why connections last failed, such as the network being down. */
+  problem: string | null;
   segments: Segment[];
+}
+
+/** What a link points to, found out before downloading it. */
+export interface LinkInfo {
+  fileName: string | null;
+  total: number | null;
+  resumable: boolean;
 }
 
 export interface Schedule {
@@ -99,10 +121,14 @@ export const api = {
   list: () => invoke<DownloadRecord[]>("list_downloads"),
   get: (id: number) => invoke<DownloadRecord>("get_download", { id }),
   defaultDir: () => invoke<string | null>("default_dir"),
+  inspect: (url: string, headers: [string, string][]) =>
+    invoke<LinkInfo>("inspect_link", { url, headers }),
+  freeSpace: (dir: string) => invoke<number | null>("free_space", { dir }),
   add: (request: AddRequest) => invoke<number>("add_download", { request }),
   start: (id: number) => invoke<void>("start_download", { id }),
   pause: (id: number) => invoke<void>("pause_download", { id }),
   restart: (id: number) => invoke<void>("restart_download", { id }),
+  setUrl: (id: number, url: string) => invoke<void>("set_download_url", { id, url }),
   remove: (id: number, deleteFiles: boolean) =>
     invoke<void>("remove_download", { id, deleteFiles }),
   setQueue: (id: number, queue: number) => invoke<void>("set_download_queue", { id, queue }),

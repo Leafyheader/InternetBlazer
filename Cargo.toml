@@ -19,7 +19,10 @@ chrono = { version = "0.4.42", default-features = false, features = ["clock", "s
 clap = { version = "4.6", features = ["derive"] }
 dirs = "6"
 file_icon_provider = "1"
+fastrand = "2"
 futures-util = "0.3"
+httpdate = "1"
+libc = "0.2"
 parking_lot = "0.12"
 percent-encoding = "2"
 png = "0.18"
@@ -38,7 +41,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 [profile.release]
 lto = "thin"

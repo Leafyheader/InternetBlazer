@@ -34,6 +34,12 @@ async function showSettings() {
   const settings = await loadSettings();
   $("enabled").checked = settings.enabled;
   $("file-types").value = settings.fileTypes;
+  showReset(settings.fileTypes);
+}
+
+/** An edited list is saved as is, so it misses types later versions add to the defaults. */
+function showReset(fileTypes) {
+  $("reset-types").hidden = fileTypes === DEFAULT_SETTINGS.fileTypes;
 }
 
 $("dismiss").addEventListener("click", async () => {
@@ -52,7 +58,16 @@ $("enabled").addEventListener("change", (e) => {
 
 // Saved while typing: the popup closes, without a change event, when it loses focus.
 $("file-types").addEventListener("input", (e) => {
-  chrome.storage.local.set({ fileTypes: [...parseFileTypes(e.target.value)].join(" ") });
+  const fileTypes = [...parseFileTypes(e.target.value)].join(" ");
+  chrome.storage.local.set({ fileTypes });
+  showReset(fileTypes);
+});
+
+$("reset-types").addEventListener("click", async () => {
+  // Removed rather than saved, so the list follows future defaults again.
+  await chrome.storage.local.remove("fileTypes");
+  $("file-types").value = DEFAULT_SETTINGS.fileTypes;
+  showReset(DEFAULT_SETTINGS.fileTypes);
 });
 
 showStatus();

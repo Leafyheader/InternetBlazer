@@ -41,6 +41,9 @@ pub enum Status {
     /// Waiting for a free slot in its queue.
     Queued,
     Downloading,
+    /// Waiting to try again after a temporary failure, such as a lost connection. See
+    /// [`DownloadRecord::retry`].
+    Retrying,
     Paused,
     Completed,
     Failed,
@@ -73,6 +76,14 @@ pub struct DownloadRecord {
     pub segments: Vec<Segment>,
     pub status: Status,
     pub error: Option<String>,
+    /// The automatic retry after a temporary failure, kept while the download tries again.
+    #[serde(default)]
+    pub retry: Option<Retry>,
+    /// It was running or waiting to run when the engine last stopped without anyone pausing it,
+    /// as when the app quits or crashes. [`Engine::resume_interrupted`](crate::Engine::resume_interrupted) picks
+    /// these up again.
+    #[serde(default)]
+    pub interrupted: bool,
     /// Unix timestamp in seconds.
     pub added_at: u64,
     pub completed_at: Option<u64>,
@@ -93,6 +104,16 @@ impl DownloadRecord {
     }
 }
 
+/// An automatic retry: the how-manyth in a row, and when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Retry {
+    /// Counts from 1, and starts over whenever an attempt makes progress.
+    pub attempt: u32,
+    /// Unix timestamp in seconds.
+    pub at: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Progress {
@@ -103,8 +124,24 @@ pub struct Progress {
     pub speed: u64,
     /// Connections currently receiving data.
     pub connections: usize,
+    /// Nothing has arrived for a few seconds, and not because of a speed limit.
+    pub stalled: bool,
+    /// While stalled: the latest reason a connection failed, such as the network being down.
+    /// Connections keep trying again on their own for a while before the download itself
+    /// counts as failed and turns [`Status::Retrying`].
+    pub problem: Option<String>,
     /// Sorted by start offset.
     pub segments: Vec<Segment>,
+}
+
+/// What a link points to, found out without downloading it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkInfo {
+    /// The name the server suggests, before it is made unique in a folder.
+    pub file_name: Option<String>,
+    pub total: Option<u64>,
+    pub resumable: bool,
 }
 
 /// Engine-wide settings that persist in the [`Store`](crate::Store).

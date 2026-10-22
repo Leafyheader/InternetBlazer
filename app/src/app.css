@@ -398,6 +398,14 @@ main {
 .progress.failed .label {
   color: var(--danger);
 }
+.progress.retrying .fill,
+.progress.stalled .fill {
+  background: var(--warn);
+}
+.progress.retrying .label,
+.progress.stalled .label {
+  color: var(--warn);
+}
 .bar.indeterminate .fill {
   position: absolute;
   width: 30% !important;
@@ -539,6 +547,14 @@ dialog label {
 }
 dialog label > span {
   color: var(--muted);
+}
+/* What the add dialog found out about the link or the folder, under its field. */
+dialog label > .link-info {
+  min-height: 1.4em;
+  color: var(--text);
+}
+dialog label > .link-info.warn {
+  color: var(--warn);
 }
 dialog label.check {
   flex-direction: row;

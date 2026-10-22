@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    path::PathBuf,
+    process::ExitCode,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
 use blazer_core::{
@@ -39,6 +43,9 @@ enum Command {
     Resume { id: u64 },
     /// Download a file again from the start.
     Restart { id: u64 },
+    /// Give a paused or failed download a new address for the same file, such as a fresh link
+    /// after the old one expired. The progress is kept.
+    SetUrl { id: u64, url: String },
     /// List all downloads.
     List,
     /// Show or set the speed limit for all downloads, shared with the desktop app.
@@ -102,6 +109,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             engine.restart(DownloadId(id)).await?;
             follow(&engine, DownloadId(id)).await?
         }
+        Command::SetUrl { id, url } => {
+            engine.set_url(DownloadId(id), &url).await?;
+            println!("Updated the address. Resume with: blazer resume {id}");
+            ExitCode::SUCCESS
+        }
         Command::List => {
             print_list(&engine.list()?);
             ExitCode::SUCCESS
@@ -139,10 +151,25 @@ async fn follow(engine: &Engine, id: DownloadId) -> anyhow::Result<ExitCode> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut pausing = false;
-    while engine.is_active(id) {
+    // Waiting to retry, or for its turn in the queue, still counts as going.
+    let going = || -> anyhow::Result<bool> {
+        let status = engine.get(id)?.status;
+        Ok(engine.is_active(id) || matches!(status, Status::Queued | Status::Retrying))
+    };
+    while going()? {
         tokio::select! {
             event = events.recv() => match event {
                 Ok(Event::Progress(p)) if p.id == id => print_progress(&p),
+                Ok(Event::StatusChanged { id: changed, status: Status::Retrying, error })
+                    if changed == id =>
+                {
+                    let wait = engine.get(id)?.retry.map(|r| r.at.saturating_sub(now()));
+                    eprint!(
+                        "\r{}; retrying in {}\x1b[K",
+                        error.as_deref().unwrap_or("failed"),
+                        duration(wait.unwrap_or(0))
+                    );
+                }
                 Ok(_) | Err(RecvError::Lagged(_)) => {}
                 Err(RecvError::Closed) => break,
             },
@@ -175,6 +202,10 @@ async fn follow(engine: &Engine, id: DownloadId) -> anyhow::Result<ExitCode> {
 }
 
 fn print_progress(p: &Progress) {
+    if let Some(problem) = &p.problem {
+        eprint!("\r{}  {problem}; reconnecting...\x1b[K", bytes(p.downloaded));
+        return;
+    }
     let line = match p.total {
         Some(total) if total > 0 => {
             let percent = p.downloaded as f64 * 100.0 / total as f64;
@@ -261,4 +292,8 @@ fn duration(secs: u64) -> String {
         s if s >= 60 => format!("{}m{:02}s", s / 60, s % 60),
         s => format!("{s}s"),
     }
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }

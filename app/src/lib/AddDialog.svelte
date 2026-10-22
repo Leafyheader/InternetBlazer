@@ -1,8 +1,9 @@
 <script lang="ts">
   import { open as pickFolder } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { api, type Incoming, MAIN_QUEUE } from "./api";
+  import { api, type Incoming, type LinkInfo, MAIN_QUEUE } from "./api";
   import { downloads } from "./downloads.svelte";
+  import { bytes } from "./format";
   import Icon from "./Icon.svelte";
 
   let {
@@ -30,6 +31,57 @@
   let busy = $state(false);
   let error = $state("");
   let dialog: HTMLDialogElement;
+
+  /** What the link points to, checked while the user fills in the rest. */
+  let info = $state<LinkInfo | null>(null);
+  let checking = $state(false);
+  let checkError = $state("");
+  /** Bytes free where the file goes, or null when unknown. */
+  let free = $state<number | null>(null);
+  let tooBig = $derived(info?.total != null && free !== null && info.total > free);
+
+  // Checks the link once typing pauses. An answer for an address that has changed since is
+  // dropped. Only `url` and `prefill` may be read here: reading state this effect sets, such
+  // as `checking`, would rerun it whenever a check finishes, and so check forever.
+  $effect(() => {
+    const target = url.trim();
+    const headers = prefill?.headers ?? [];
+    const valid = /^https?:\/\/\S+$/i.test(target);
+    info = null;
+    checkError = "";
+    checking = valid;
+    if (!valid) return;
+    let stale = false;
+    const timer = setTimeout(async () => {
+      try {
+        const result = await api.inspect(target, headers);
+        if (!stale) info = result;
+      } catch (err) {
+        if (!stale) checkError = String(err);
+      } finally {
+        if (!stale) checking = false;
+      }
+    }, 400);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  });
+
+  $effect(() => {
+    const target = dir.trim();
+    free = null;
+    if (!target) return;
+    let stale = false;
+    const timer = setTimeout(async () => {
+      const result = await api.freeSpace(target).catch(() => null);
+      if (!stale) free = result;
+    }, 300);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  });
 
   function readLastDir(): string {
     try {
@@ -95,6 +147,20 @@
         autofocus
         spellcheck="false"
       />
+      <span class="link-info" aria-live="polite">
+        {#if checking}
+          <span class="muted">Checking link…</span>
+        {:else if info}
+          <span>{info.total === null ? "Size unknown" : bytes(info.total)}</span>
+          {#if info.resumable}
+            <span class="muted">· can be paused and resumed</span>
+          {:else}
+            <span class="warn">· can't resume: pausing starts over</span>
+          {/if}
+        {:else if checkError}
+          <span class="warn">{checkError}</span>
+        {/if}
+      </span>
     </label>
 
     <label>
@@ -103,12 +169,17 @@
         <input bind:value={dir} required spellcheck="false" />
         <button type="button" onclick={browse}><Icon name="folder" />Browse</button>
       </div>
+      {#if free !== null}
+        <span class="link-info" class:warn={tooBig}>
+          {tooBig ? `Not enough space: ${bytes(free)} free` : `${bytes(free)} free`}
+        </span>
+      {/if}
     </label>
 
     <div class="inline">
       <label class="grow">
         <span>File name</span>
-        <input bind:value={fileName} placeholder="Use the name from the server" spellcheck="false" />
+        <input bind:value={fileName} placeholder={info?.fileName ?? "Use the name from the server"} spellcheck="false" />
       </label>
       <label>
         <span>Connections</span>

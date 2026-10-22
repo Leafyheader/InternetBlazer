@@ -1,8 +1,17 @@
 <script lang="ts">
-  import { downloads, STATUS_LABELS, type Item } from "./downloads.svelte";
-  import { bytes, date } from "./format";
+  import { clock } from "./clock.svelte";
+  import { downloads, retryIn, STATUS_LABELS, type Item } from "./downloads.svelte";
+  import { bytes, date, duration } from "./format";
 
-  let { item, onlimit }: { item: Item; onlimit: () => void } = $props();
+  let {
+    item,
+    onlimit,
+    onaddress,
+  }: { item: Item; onlimit: () => void; onaddress: () => void } = $props();
+
+  // A running download is paused first; a finished one needs no new address.
+  let canChangeAddress = $derived(["paused", "failed", "retrying"].includes(item.status));
+  let wait = $derived(retryIn(item, clock.now));
 
   let path = $derived.by(() => {
     const sep = item.dir.includes("\\") ? "\\" : "/";
@@ -28,7 +37,10 @@
 
   <dl>
     <dt>Address</dt>
-    <dd class="selectable">{item.url}</dd>
+    <dd>
+      <span class="selectable">{item.url}</span>
+      {#if canChangeAddress}· <button class="link" onclick={onaddress}>Change</button>{/if}
+    </dd>
     <dt>Saved to</dt>
     <dd class="selectable">{path}</dd>
     <dt>Size</dt>
@@ -39,7 +51,16 @@
     <dt>Status</dt>
     <dd>
       {STATUS_LABELS[item.status]}
-      {#if item.status === "downloading"}· {item.activeConnections} connections{/if}
+      {#if item.status === "downloading" && item.problem}
+        · <span class="warn">reconnecting</span>
+      {:else if item.status === "downloading" && item.stalled}
+        · <span class="warn">no data arriving</span>
+      {:else if item.status === "downloading"}
+        · {item.activeConnections} connections
+      {/if}
+      {#if item.status === "retrying" && item.retry}
+        · attempt {item.retry.attempt}, {wait ? `in ${duration(wait)}` : "starting"}
+      {/if}
     </dd>
     <dt>Resume</dt>
     <dd>
@@ -58,8 +79,12 @@
     </dd>
     <dt>Added</dt>
     <dd>{date(item.addedAt)}{#if item.completedAt} · finished {date(item.completedAt)}{/if}</dd>
+    {#if item.status === "downloading" && item.problem}
+      <dt>Connection</dt>
+      <dd class="error-text selectable">{item.problem}; trying again</dd>
+    {/if}
     {#if item.error}
-      <dt>Error</dt>
+      <dt>{item.status === "retrying" ? "Last error" : "Error"}</dt>
       <dd class="error-text selectable">{item.error}</dd>
     {/if}
   </dl>

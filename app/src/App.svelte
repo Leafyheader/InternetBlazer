@@ -11,6 +11,7 @@
     FILTERS,
     inView,
     percent,
+    retryIn,
     STATUS_LABELS,
     type Item,
     type View,
@@ -20,6 +21,8 @@
   import QueueDialog from "./lib/QueueDialog.svelte";
   import RemoveDialog from "./lib/RemoveDialog.svelte";
   import SpeedLimitDialog from "./lib/SpeedLimitDialog.svelte";
+  import UrlDialog from "./lib/UrlDialog.svelte";
+  import { clock } from "./lib/clock.svelte";
 
   let view = $state<View>({ filter: "all" });
   const selected = new SvelteSet<number>();
@@ -33,6 +36,8 @@
   let queueDialog = $state<{ queue: Queue | null } | null>(null);
   /** Whose speed limit is being changed. */
   let limitDialog = $state<"global" | Item | null>(null);
+  /** The download whose address is being changed. */
+  let urlDialog = $state<Item | null>(null);
   let toast = $state("");
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -44,11 +49,12 @@
   let selection = $derived(visible.filter((item) => selected.has(item.id)));
   let single = $derived(selection.length === 1 ? selection[0] : null);
   let activeCount = $derived(
-    downloads.sorted.filter((i) => i.status === "downloading" || i.status === "queued").length,
+    downloads.sorted.filter((i) => ["downloading", "queued", "retrying"].includes(i.status)).length,
   );
 
-  const canResume = (i: Item) => i.status === "paused" || i.status === "failed";
-  const canPause = (i: Item) => i.status === "downloading" || i.status === "queued";
+  // A download waiting to retry can be started right away, or paused to stop retrying.
+  const canResume = (i: Item) => ["paused", "failed", "retrying"].includes(i.status);
+  const canPause = (i: Item) => ["downloading", "queued", "retrying"].includes(i.status);
 
   // A removed queue cannot stay in view.
   $effect(() => {
@@ -131,7 +137,7 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
-    if (adding || incoming.length > 0 || removing || queueDialog || limitDialog) return;
+    if (adding || incoming.length > 0 || removing || queueDialog || limitDialog || urlDialog) return;
     const target = e.target as HTMLElement;
     if (target.closest("input, textarea, select, dialog")) return;
     const ctrl = e.ctrlKey || e.metaKey;
@@ -304,15 +310,26 @@
             {/if}
           </span>
           <span class="muted">{item.total === null ? "—" : bytes(item.total)}</span>
-          <span class="progress {item.status}">
+          <span
+            class="progress {item.status}"
+            class:stalled={item.status === "downloading" && item.stalled}
+            title={item.status === "downloading" ? (item.problem ?? undefined) : undefined}
+          >
             <span class="bar" class:indeterminate={pct === null && item.status === "downloading"}>
               <span class="fill" style="width: {pct ?? 0}%"></span>
             </span>
             <span class="label">
-              {#if item.status === "downloading" && pct !== null}
+              {#if item.status === "downloading" && item.problem}
+                Reconnecting…
+              {:else if item.status === "downloading" && item.stalled}
+                No data{pct === null ? "" : ` · ${pct.toFixed(1)}%`}
+              {:else if item.status === "downloading" && pct !== null}
                 {pct.toFixed(1)}%
               {:else if item.status === "downloading"}
                 {bytes(item.downloaded)}
+              {:else if item.status === "retrying"}
+                {@const wait = retryIn(item, clock.now)}
+                {wait ? `Retrying in ${duration(wait)}` : "Retrying…"}
               {:else if (item.status === "paused" || item.status === "queued") && pct}
                 {STATUS_LABELS[item.status]} · {pct.toFixed(0)}%
               {:else}
@@ -338,7 +355,7 @@
 
     {#if single}
       {@const item = single}
-      <Details {item} onlimit={() => (limitDialog = item)} />
+      <Details {item} onlimit={() => (limitDialog = item)} onaddress={() => (urlDialog = item)} />
     {/if}
 
     <footer class="statusbar">
@@ -387,6 +404,9 @@
     onsave={saveLimit}
     onclose={() => (limitDialog = null)}
   />
+{/if}
+{#if urlDialog}
+  <UrlDialog item={urlDialog} onclose={() => (urlDialog = null)} />
 {/if}
 {#if removing}
   <RemoveDialog items={removing} onclose={() => (removing = null)} />

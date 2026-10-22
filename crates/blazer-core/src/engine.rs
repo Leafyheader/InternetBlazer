@@ -15,7 +15,7 @@ use crate::{
     probe,
     queue::{self, Queue},
     store::{RedbStore, Store},
-    types::{self, DownloadId, DownloadRecord, Event, QueueId, Settings, Status},
+    types::{self, DownloadId, DownloadRecord, Event, LinkInfo, QueueId, Retry, Settings, Status},
 };
 
 pub const MAX_CONNECTIONS: usize = 32;
@@ -31,9 +31,17 @@ pub struct Config {
     pub max_retries: u32,
     /// Base delay between retries, doubled on each consecutive failure.
     pub retry_delay: Duration,
+    /// Times a download that failed for a temporary reason, such as a lost connection, is tried
+    /// again on its own before it counts as failed.
+    pub auto_retries: u32,
+    /// Wait before the first automatic retry, doubled for each one after it.
+    pub auto_retry_delay: Duration,
+    pub max_auto_retry_delay: Duration,
     pub connect_timeout: Duration,
     /// Drops a connection that receives nothing for this long.
     pub read_timeout: Duration,
+    /// Progress reports a download as stalled once nothing has arrived for this long.
+    pub stall_after: Duration,
     /// Bytes each connection buffers before writing to disk.
     pub write_buffer: usize,
     pub progress_interval: Duration,
@@ -49,8 +57,13 @@ impl Default for Config {
             min_split_size: 1024 * 1024,
             max_retries: 8,
             retry_delay: Duration::from_secs(1),
+            // About an hour of retries in all: enough for a router restart or a laptop's sleep.
+            auto_retries: 10,
+            auto_retry_delay: Duration::from_secs(15),
+            max_auto_retry_delay: Duration::from_secs(10 * 60),
             connect_timeout: Duration::from_secs(15),
             read_timeout: Duration::from_secs(30),
+            stall_after: Duration::from_secs(3),
             write_buffer: 512 * 1024,
             progress_interval: Duration::from_millis(250),
             checkpoint_interval: Duration::from_secs(1),
@@ -105,7 +118,7 @@ pub(crate) struct Inner {
     active: Mutex<HashMap<DownloadId, Active>>,
     tasks: TaskTracker,
     /// Cancelled on shutdown; the parent of every running download's token.
-    closed: CancellationToken,
+    pub(crate) closed: CancellationToken,
     /// Held while deciding what runs, so that starting, pausing and finishing downloads see each
     /// other's status changes. Taken before `records` and `active`.
     sched: Mutex<()>,
@@ -165,14 +178,46 @@ impl Inner {
         Ok(record)
     }
 
-    /// Queues or pauses a download that is not running. The caller holds `sched`.
+    /// Queues or pauses a download that is not running, as someone asked. The caller holds
+    /// `sched`.
     fn set_status(&self, id: DownloadId, status: Status) -> Result<()> {
         self.update(id, |r| {
             r.status = status;
             r.error = None;
+            r.retry = None;
+            r.interrupted = false;
         })?;
         self.emit(Event::StatusChanged { id, status, error: None });
         Ok(())
+    }
+
+    /// Queues the download again after `delay`, unless it was paused, started or removed in the
+    /// meantime.
+    pub(crate) fn retry_later(self: &Arc<Self>, id: DownloadId, retry: Retry, delay: Duration) {
+        let inner = self.clone();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                // It is picked up again with the other interrupted downloads.
+                () = inner.closed.cancelled() => return,
+            }
+            let result = {
+                let _sched = inner.sched.lock();
+                inner.update(id, |r| {
+                    if r.status == Status::Retrying && r.retry == Some(retry) {
+                        r.status = Status::Queued;
+                    }
+                })
+            };
+            match result {
+                Ok(r) if r.status == Status::Queued => {
+                    inner.emit(Event::StatusChanged { id, status: r.status, error: r.error });
+                    inner.dispatch();
+                }
+                Ok(_) | Err(Error::NotFound(_)) => {}
+                Err(e) => tracing::error!(%id, "failed to retry download: {e}"),
+            }
+        });
     }
 
     /// Starts queued downloads, oldest first, while their queues have free slots.
@@ -224,13 +269,27 @@ impl Engine {
     }
 
     pub fn with_store(store: Arc<dyn Store>, config: Config) -> Result<Self> {
-        // A download still marked as running was cut off by a crash or power loss. Queued ones
-        // are paused too, so opening the engine (say, to list downloads) never starts any.
         for mut record in store.list()? {
-            if matches!(record.status, Status::Downloading | Status::Queued) {
+            if record.status != Status::Completed && finished_on_disk(&record) {
+                tracing::info!(id = %record.id, "found finished download; marking it complete");
+                record.status = Status::Completed;
+                record.completed_at = Some(types::now());
+                record.error = None;
+                record.retry = None;
+                record.interrupted = false;
+            } else if matches!(
+                record.status,
+                Status::Downloading | Status::Queued | Status::Retrying
+            ) {
+                // Cut off by quitting, a crash or a power loss. Paused, so opening the engine
+                // (say, to list downloads) never starts any; see `resume_interrupted`.
                 record.status = Status::Paused;
-                store.save(&record)?;
+                record.retry = None;
+                record.interrupted = true;
+            } else {
+                continue;
             }
+            store.save(&record)?;
         }
         if !store.queues()?.iter().any(|q| q.id == QueueId::MAIN) {
             store.save_queue(&Queue::main())?;
@@ -274,14 +333,22 @@ impl Engine {
         self.inner.active.lock().contains_key(&id)
     }
 
+    /// Finds out what a link points to, such as its size, without adding a download.
+    pub async fn inspect(&self, url: &str, headers: &[(String, String)]) -> Result<LinkInfo> {
+        let url = parse_url(url)?;
+        let info = probe::probe(&self.inner.client, url.as_str(), headers).await?;
+        Ok(LinkInfo {
+            file_name: info.file_name.map(|name| filename::sanitize(&name)),
+            total: info.total,
+            resumable: info.resumable,
+        })
+    }
+
     /// Probes the URL, picks a unique file name and records the download.
     pub async fn add(&self, new: NewDownload) -> Result<DownloadId> {
         let queue = new.queue.unwrap_or(QueueId::MAIN);
         self.queue(queue)?;
-        let url = url::Url::parse(&new.url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(Error::InvalidUrl(format!("unsupported scheme `{}`", url.scheme())));
-        }
+        let url = parse_url(&new.url)?;
         let info = probe::probe(&self.inner.client, url.as_str(), &new.headers).await?;
 
         let suggested = new.file_name.as_deref().or(info.file_name.as_deref());
@@ -315,6 +382,8 @@ impl Engine {
             segments: Vec::new(),
             status: if new.start { Status::Queued } else { Status::Paused },
             error: None,
+            retry: None,
+            interrupted: false,
             added_at: types::now(),
             completed_at: None,
         };
@@ -326,7 +395,8 @@ impl Engine {
         Ok(id)
     }
 
-    /// Queues a paused or failed download. It starts as soon as its queue has a free slot.
+    /// Queues a paused or failed download, or one waiting to retry. It starts as soon as its
+    /// queue has a free slot.
     pub fn start(&self, id: DownloadId) -> Result<()> {
         self.get(id)?;
         self.enqueue(|r| r.id == id)
@@ -355,7 +425,7 @@ impl Engine {
         {
             let _sched = self.inner.sched.lock();
             for record in self.list()? {
-                if matches!(record.status, Status::Paused | Status::Failed)
+                if matches!(record.status, Status::Paused | Status::Failed | Status::Retrying)
                     && !self.is_active(record.id)
                     && pick(&record)
                 {
@@ -376,7 +446,7 @@ impl Engine {
         for record in records.iter().filter(|r| pick(r)) {
             if let Some(active) = self.inner.active.lock().get(&record.id) {
                 active.cancel.cancel();
-            } else if record.status == Status::Queued
+            } else if matches!(record.status, Status::Queued | Status::Retrying)
                 && let Err(e) = self.inner.set_status(record.id, Status::Paused)
             {
                 tracing::error!(id = %record.id, "failed to pause download: {e}");
@@ -384,7 +454,15 @@ impl Engine {
         }
     }
 
-    /// Waits until the download is not running, and returns its final record.
+    /// Queues the downloads that were running or waiting to run when the engine last stopped,
+    /// such as when the app quit or crashed. Meant for the desktop app as it starts; a tool
+    /// that only lists downloads should not call it.
+    pub fn resume_interrupted(&self) -> Result<()> {
+        self.enqueue(|r| r.interrupted)
+    }
+
+    /// Waits until the download is not running, and returns its final record. One waiting to
+    /// retry counts as not running.
     pub async fn wait(&self, id: DownloadId) -> Result<DownloadRecord> {
         let mut events = self.subscribe();
         // A finishing download deactivates before it announces its new status, so every pass
@@ -412,11 +490,69 @@ impl Engine {
                 r.segments.clear();
                 r.status = Status::Queued;
                 r.error = None;
+                r.retry = None;
+                r.interrupted = false;
                 r.completed_at = None;
             })?;
         }
         self.inner.emit(Event::StatusChanged { id, status: Status::Queued, error: None });
         self.inner.dispatch();
+        Ok(())
+    }
+
+    /// Points a download that is not running at a new address, such as a fresh link after the
+    /// old one expired. Progress is kept, so once some of the file is downloaded the new address
+    /// must serve the same file: the same size and version, with resume support.
+    pub async fn set_url(&self, id: DownloadId, url: &str) -> Result<()> {
+        let url = parse_url(url)?;
+        let record = self.get(id)?;
+        let info = probe::probe(&self.inner.client, url.as_str(), &record.headers).await?;
+        let started = record.downloaded() > 0;
+        if started {
+            let size = |n: Option<u64>| n.map_or("unknown".into(), crate::fsio::format_bytes);
+            if info.total != record.total {
+                return Err(Error::Invalid(format!(
+                    "the new address has a different file: its size is {}, not {}",
+                    size(info.total),
+                    size(record.total)
+                )));
+            }
+            if !info.matches(record.etag.as_deref(), record.last_modified.as_deref()) {
+                return Err(Error::Invalid(
+                    "the new address has a different version of the file".into(),
+                ));
+            }
+            if !info.resumable {
+                return Err(Error::Invalid(
+                    "the new address cannot resume downloads, so the progress would be lost; \
+                     restart the download instead"
+                        .into(),
+                ));
+            }
+        }
+        let record = {
+            let _sched = self.inner.sched.lock();
+            if self.is_active(id) {
+                return Err(Error::Invalid(
+                    "pause the download before changing its address".into(),
+                ));
+            }
+            if self.get(id)?.status == Status::Completed {
+                return Err(Error::Invalid("the download has already finished".into()));
+            }
+            self.inner.update(id, |r| {
+                r.url = url.into();
+                r.error = None;
+                if !started {
+                    r.total = info.total;
+                    r.resumable = info.resumable;
+                    r.etag = info.etag;
+                    r.last_modified = info.last_modified;
+                    r.segments.clear();
+                }
+            })?
+        };
+        self.inner.emit(Event::Updated(record));
         Ok(())
     }
 
@@ -561,6 +697,25 @@ impl Engine {
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
     }
+}
+
+fn parse_url(url: &str) -> Result<url::Url> {
+    let url = url::Url::parse(url.trim()).map_err(|e| Error::InvalidUrl(e.to_string()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::InvalidUrl(format!("unsupported scheme `{}`", url.scheme())));
+    }
+    Ok(url)
+}
+
+/// Whether the download finished but the engine stopped before recording it: the `.part` file
+/// is gone, and a file of the full size has its name. `finalize` saves the finished progress
+/// before renaming, which makes this check possible.
+fn finished_on_disk(record: &DownloadRecord) -> bool {
+    let Some(total) = record.total else { return false };
+    !record.segments.is_empty()
+        && record.downloaded() == total
+        && !record.part_path().exists()
+        && std::fs::metadata(record.path()).is_ok_and(|m| m.is_file() && m.len() == total)
 }
 
 /// Checks a queue before it is saved, and trims its name.

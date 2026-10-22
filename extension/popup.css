@@ -156,6 +156,14 @@ textarea {
   resize: vertical;
 }
 
+button.reset {
+  margin-top: 6px;
+}
+
+button[hidden] {
+  display: none;
+}
+
 textarea:focus,
 button:focus-visible {
   outline: 2px solid var(--accent);
