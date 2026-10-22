@@ -197,6 +197,8 @@ pub struct MediaChoice {
 pub struct MediaTools {
     /// `None` until it is installed.
     pub ytdlp: Option<Tool>,
+    /// Runs YouTube's JavaScript for yt-dlp. Without it, YouTube offers yt-dlp fewer formats.
+    pub deno: Option<Tool>,
     pub ffmpeg: Option<PathBuf>,
 }
 

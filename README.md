@@ -21,7 +21,7 @@ A fast, open-source, cross-platform download manager written in Rust: an IDM alt
 - **Queues.** Started downloads wait in a queue that runs a set number at a time, oldest first. You can add your own queues and move downloads between them.
 - **Scheduler.** A queue can start and stop at set times on chosen weekdays (local time), for example overnight. A stop time at or before the start time means the next day. Schedules run only while the desktop app is open.
 - **Speed limits.** One limit for all downloads together, plus an optional limit per download. Both can be changed while downloads run.
-- **Videos from web pages.** For a link to a page with a video, such as on YouTube, [yt-dlp](https://github.com/yt-dlp/yt-dlp) finds the video and the qualities it comes in, and downloads it. These downloads queue, pause, resume and retry like any other. yt-dlp is installed on first use from its official release, after checking the release's published SHA-256, and can be updated from Settings; a copy on `PATH` also works. Sites like YouTube keep picture and sound apart, and joining them needs [ffmpeg](https://ffmpeg.org) on `PATH` (on Windows: `winget install ffmpeg`). Without it, only the sound or qualities that come in one file are offered.
+- **Videos from web pages.** For a link to a page with a video, such as on YouTube, [yt-dlp](https://github.com/yt-dlp/yt-dlp) finds the video and the qualities it comes in, and downloads it. These downloads queue, pause, resume and retry like any other. yt-dlp is installed on first use from its official release, after checking the release's published SHA-256, and can be updated from Settings; a copy on `PATH` also works. On Windows it is yt-dlp's folder build, which starts in under a second instead of three. For YouTube, yt-dlp also needs [deno](https://deno.com) to get every quality, which Settings can install the same way. An HLS (`.m3u8`) or DASH (`.mpd`) playlist link is read directly, which lists its qualities in a moment. Sites like YouTube keep picture and sound apart, and joining them needs [ffmpeg](https://ffmpeg.org) on `PATH` (on Windows: `winget install ffmpeg`). Without it, only the sound or qualities that come in one file are offered.
 
 ## Layout
 
@@ -63,7 +63,7 @@ Closing the window keeps the app running in the tray, so downloads carry on. Cli
 Settings, at the bottom of the sidebar:
 
 - **Downloads:** the default folder, or whether to start in the folder used last; connections per download; how many automatic retries a download gets. The connections and retries settings are shared with the CLI.
-- **Video downloads:** the yt-dlp version, with a button to update it, and whether ffmpeg was found.
+- **Video downloads:** the yt-dlp version, with a button to update it; deno, which yt-dlp needs for every YouTube quality, with a button to install it; and whether ffmpeg was found.
 - **Browser:** whether files from the extension wait in the download dialog or start right away in the default folder.
 - **Desktop:** starting at sign-in (hidden in the tray), keeping the app in the tray when the window is closed, and notifications when downloads finish or fail while the window is in the background.
 
@@ -74,6 +74,8 @@ Shortcuts: Ctrl+N adds a download, Delete removes the selection, Enter opens a f
 ## Browser extension
 
 The extension hands downloads to the app: browser downloads whose file type is on its list (set in the extension's popup), and any link through "Download with InternetBlazer" in the right-click menu. The app shows each one in the add dialog, filled in, and starts itself if it is not running. The browser's cookies, referrer and user agent go along, so downloads that need you to be signed in work. Downloads in private windows stay in the browser.
+
+Videos get a "Download video" button in their top right corner while the pointer is over them or when they start playing. It lists the video's qualities; pick one to send the video to the app, named after the page. When the player loads an HLS or DASH playlist, the app reads its qualities right away (while it runs), so they are ready before the button is clicked; the download keeps the headers the browser sent for it, which some video servers check. On pages without one, such as YouTube, the button asks yt-dlp, which a video that keeps playing gets in the background. Videos protected with DRM can't be downloaded. The button can be turned off in the popup.
 
 The browser reaches the app through `blazer-host`, a native messaging host that must sit next to the app executable:
 

@@ -16,6 +16,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub use install::{CHROME_EXTENSION_IDS, FIREFOX_EXTENSION_ID, HOST_NAME, install, uninstall};
 
@@ -28,6 +29,9 @@ pub enum Request {
     /// Brings the app window to the front.
     Show,
     Download(BrowserDownload),
+    /// Asks which videos yt-dlp finds on the page at the URL. The answer is in
+    /// [`Response::media`].
+    Inspect(BrowserDownload),
 }
 
 /// A download the browser handed over, with what the server needs to recognize the browser's
@@ -41,18 +45,42 @@ pub struct BrowserDownload {
     /// A `Cookie` header value.
     pub cookies: Option<String>,
     pub user_agent: Option<String>,
+    /// Sent by the browser when a page's script fetched the file from another site, as players
+    /// fetch video streams. Some video servers refuse requests without it.
+    pub origin: Option<String>,
+    /// The rest of what the browser sent for a stream, such as `Accept-Language` and
+    /// `Sec-Fetch-Mode`, which some video servers check as well.
+    pub extra_headers: Vec<(String, String)>,
+    /// The URL is a playlist a video player fetched (HLS or DASH), though it may not look like
+    /// one.
+    pub stream: bool,
+    /// For a video, the quality picked from what [`Request::Inspect`] found, as the app's
+    /// `MediaFormat`. The URL is then the page with the video.
+    pub media: Option<Value>,
 }
 
 impl BrowserDownload {
     /// The request headers that make the server treat the engine like the browser.
     pub fn headers(&self) -> Vec<(String, String)> {
-        [("Cookie", &self.cookies), ("Referer", &self.referrer), ("User-Agent", &self.user_agent)]
-            .into_iter()
-            .filter_map(|(name, value)| {
-                let value = value.as_deref()?.trim();
-                (!value.is_empty()).then(|| (name.to_string(), value.to_string()))
-            })
-            .collect()
+        let mut known = [
+            ("Cookie", &self.cookies),
+            ("Referer", &self.referrer),
+            ("User-Agent", &self.user_agent),
+            ("Origin", &self.origin),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let value = value.as_deref()?.trim();
+            (!value.is_empty()).then(|| (name.to_string(), value.to_string()))
+        })
+        .collect::<Vec<_>>();
+        for (name, value) in &self.extra_headers {
+            let taken = known.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+            if !taken && !name.trim().is_empty() && !value.trim().is_empty() {
+                known.push((name.trim().to_string(), value.trim().to_string()));
+            }
+        }
+        known
     }
 }
 
@@ -61,15 +89,22 @@ pub struct Response {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What [`Request::Inspect`] found, as the app's `MediaInfo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Value>,
 }
 
 impl Response {
     pub fn ok() -> Self {
-        Self { ok: true, error: None }
+        Self { ok: true, error: None, media: None }
     }
 
     pub fn error(message: impl Into<String>) -> Self {
-        Self { ok: false, error: Some(message.into()) }
+        Self { ok: false, error: Some(message.into()), media: None }
+    }
+
+    pub fn media(media: Value) -> Self {
+        Self { ok: true, error: None, media: Some(media) }
     }
 }
 
@@ -136,7 +171,8 @@ fn connect() -> io::Result<std::fs::File> {
 #[cfg(unix)]
 fn connect() -> io::Result<std::os::unix::net::UnixStream> {
     let stream = std::os::unix::net::UnixStream::connect(endpoint())?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    // Looking at a page with yt-dlp can take a while.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
     Ok(stream)
 }
 
@@ -156,6 +192,19 @@ mod tests {
     }
 
     #[test]
+    fn extra_headers_follow_the_known_ones() {
+        let json = r#"{"url":"https://x/a.mpd","referrer":"https://x/","extraHeaders":[["Accept-Language","en"],["referer","https://y/"]]}"#;
+        let download: BrowserDownload = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            download.headers(),
+            [
+                ("Referer".to_string(), "https://x/".to_string()),
+                ("Accept-Language".to_string(), "en".to_string())
+            ]
+        );
+    }
+
+    #[test]
     fn request_json_shape() {
         let json = r#"{"type":"download","url":"https://x/y","fileName":"y","userAgent":"UA"}"#;
         let request: Request = serde_json::from_str(json).unwrap();
@@ -169,5 +218,17 @@ mod tests {
             })
         );
         assert_eq!(serde_json::to_string(&Response::ok()).unwrap(), r#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn video_requests_carry_the_quality() {
+        let json = r#"{"type":"download","url":"https://x/watch","media":{"type":"audio"}}"#;
+        let Request::Download(download) = serde_json::from_str(json).unwrap() else { panic!() };
+        assert_eq!(download.media, Some(serde_json::json!({"type": "audio"})));
+
+        let json = r#"{"type":"inspect","url":"https://x/watch"}"#;
+        assert!(matches!(serde_json::from_str(json).unwrap(), Request::Inspect(_)));
+        let reply = Response::media(serde_json::json!({"title": "T"}));
+        assert_eq!(serde_json::to_string(&reply).unwrap(), r#"{"ok":true,"media":{"title":"T"}}"#);
     }
 }

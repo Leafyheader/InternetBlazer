@@ -19,6 +19,8 @@
   /** Null while yt-dlp is asked for its version, which takes a moment. */
   let tools = $state<MediaTools | null>(null);
   let updating = $state(false);
+  let updatingDeno = $state(false);
+  let denoMessage = $state("");
   let toolsMessage = $state("");
 
   onMount(() => {
@@ -47,6 +49,22 @@
       toolsMessage = String(err);
     } finally {
       updating = false;
+    }
+  }
+
+  async function updateDeno() {
+    updatingDeno = true;
+    denoMessage = "";
+    try {
+      const before = tools?.deno?.managed ? tools.deno.version : null;
+      const installed = await api.installDeno();
+      denoMessage =
+        before === installed.version ? "Already the latest version." : `Installed deno ${installed.version}.`;
+      tools = await api.mediaTools();
+    } catch (err) {
+      denoMessage = String(err);
+    } finally {
+      updatingDeno = false;
     }
   }
 
@@ -148,6 +166,27 @@
               (tools.ytdlp && !tools.ytdlp.managed
                 ? "Found on your system. Installing gives InternetBlazer its own copy, which it keeps up to date."
                 : "Sites change often; when videos stop downloading, updating yt-dlp usually fixes it.")}
+          </p>
+          <div class="inline">
+            <span class="grow">
+              {#if tools.deno}
+                deno {tools.deno.version}
+                {#if !tools.deno.managed}
+                  <span class="muted path" title={tools.deno.path}>· from your system</span>
+                {/if}
+              {:else}
+                deno isn't installed.
+              {/if}
+            </span>
+            <button type="button" onclick={updateDeno} disabled={updatingDeno}>
+              {updatingDeno ? "Getting deno…" : tools.deno?.managed ? "Update deno" : "Install deno"}
+            </button>
+          </div>
+          <p class="hint {tools.deno ? 'muted' : 'warn'}" aria-live="polite">
+            {denoMessage ||
+              (tools.deno
+                ? "yt-dlp uses it to read YouTube, so every quality is offered."
+                : "Without it, YouTube offers yt-dlp fewer qualities, and none at all when you're signed in. It's about 45 MB.")}
           </p>
           {#if tools.ffmpeg}
             <p class="hint muted">

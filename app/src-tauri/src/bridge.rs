@@ -3,10 +3,13 @@
 //! A browser download normally waits in [`Bridge`] until the UI takes it and shows it in the add
 //! dialog, so the user picks where it goes; `browser-download` tells the UI that one is waiting.
 //! Users can turn that off, and then it starts right away in the usual folder.
+//!
+//! The extension's button on videos first asks what yt-dlp finds on the page, then sends the
+//! page with the quality the user picked.
 
 use std::path::PathBuf;
 
-use blazer_core::{Engine, NewDownload};
+use blazer_core::{Engine, Error, MediaFormat, MediaInfo, NewDownload};
 use blazer_host::{BrowserDownload, MAX_REQUEST, Request, Response};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -22,6 +25,8 @@ pub struct Incoming {
     url: String,
     file_name: Option<String>,
     headers: Vec<(String, String)>,
+    /// The quality picked on the page, for a video.
+    media: Option<MediaFormat>,
 }
 
 #[derive(Default)]
@@ -44,17 +49,25 @@ pub fn show_window(app: &AppHandle) {
     }
 }
 
-fn handle(app: &AppHandle, request: Request) -> Response {
+fn is_web(url: &str) -> bool {
+    let scheme = url.split_once(':').map(|(s, _)| s.to_ascii_lowercase());
+    matches!(scheme.as_deref(), Some("http" | "https"))
+}
+
+async fn handle(app: &AppHandle, request: Request) -> Response {
     match request {
         Request::Show => show_window(app),
         Request::Download(download) => {
-            let scheme = download.url.split_once(':').map(|(s, _)| s.to_ascii_lowercase());
-            if !matches!(scheme.as_deref(), Some("http" | "https")) {
+            if !is_web(&download.url) {
                 return Response::error("only http and https links can be downloaded");
             }
+            let media = match download.media.clone().map(serde_json::from_value).transpose() {
+                Ok(media) => media,
+                Err(e) => return Response::error(format!("unknown video quality: {e}")),
+            };
             let headers = download.headers();
             let BrowserDownload { url, file_name, .. } = download;
-            let incoming = Incoming { url, file_name, headers };
+            let incoming = Incoming { url, file_name, headers, media };
             let prefs = app.state::<PrefsStore>().get();
             match prefs.target_dir().filter(|_| !prefs.confirm_browser_downloads) {
                 Some(dir) => {
@@ -63,8 +76,36 @@ fn handle(app: &AppHandle, request: Request) -> Response {
                 None => confirm(app, incoming),
             }
         }
+        Request::Inspect(page) => {
+            if !is_web(&page.url) {
+                return Response::error("only http and https pages can be looked at");
+            }
+            return match inspect(app, &page).await {
+                Ok(info) => Response::media(serde_json::to_value(info).expect("serializes")),
+                Err(e) => Response::error(e.to_string()),
+            };
+        }
     }
     Response::ok()
+}
+
+/// What yt-dlp finds on the page, getting yt-dlp first if it isn't there yet.
+async fn inspect(app: &AppHandle, page: &BrowserDownload) -> blazer_core::Result<MediaInfo> {
+    let engine = app.state::<Engine>();
+    let headers = page.headers();
+    let find = || async {
+        match page.stream {
+            true => engine.inspect_stream(&page.url, &headers).await,
+            false => engine.inspect_media(&page.url, &headers).await,
+        }
+    };
+    match find().await {
+        Err(Error::NoYtdlp) => {
+            engine.install_ytdlp().await?;
+            find().await
+        }
+        result => result,
+    }
 }
 
 /// Waits for the user to confirm the download in the add dialog.
@@ -80,6 +121,7 @@ async fn add_now(app: AppHandle, incoming: Incoming, dir: PathBuf) {
     let mut new = NewDownload::new(&incoming.url, dir);
     new.file_name = incoming.file_name.clone();
     new.headers = incoming.headers.clone();
+    new.media = incoming.media;
     let engine = app.state::<Engine>();
     match engine.add(new).await {
         Ok(id) => {
@@ -107,7 +149,7 @@ async fn respond(app: AppHandle, stream: impl AsyncRead + AsyncWrite + Unpin) {
         return;
     }
     let response = match serde_json::from_str(&line) {
-        Ok(request) => handle(&app, request),
+        Ok(request) => handle(&app, request).await,
         Err(e) => Response::error(format!("bad request: {e}")),
     };
     let mut reply = serde_json::to_string(&response).expect("a response serializes");

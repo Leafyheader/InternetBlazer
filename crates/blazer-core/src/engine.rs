@@ -6,7 +6,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -18,7 +18,7 @@ use crate::{
     error::{Error, Result},
     filename, fsio,
     limit::{self, RateLimiter},
-    media, probe,
+    media, playlist, probe,
     queue::{self, Queue},
     store::{RedbStore, Store},
     tools,
@@ -31,6 +31,10 @@ use crate::{
 pub const MAX_CONNECTIONS: usize = 32;
 pub const MAX_AUTO_RETRIES: u32 = 100;
 const EVENT_CAPACITY: usize = 1024;
+/// How long what yt-dlp found on a page is reused, so the add dialog and adding the download don't
+/// ask it again right after the browser did.
+const MEDIA_CACHE_TIME: Duration = Duration::from_secs(5 * 60);
+const MEDIA_CACHE_SIZE: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -150,6 +154,21 @@ pub(crate) struct Inner {
     installing: tokio::sync::Mutex<()>,
     /// Downloads whose files are being moved, which must not start until they are in place.
     held: Mutex<HashSet<DownloadId>>,
+    /// Pages yt-dlp recently looked at, newest last.
+    media_cache: Mutex<Vec<FoundMedia>>,
+}
+
+/// What yt-dlp found on a page.
+struct FoundMedia {
+    url: String,
+    at: Instant,
+    info: MediaInfo,
+    /// Found only without the browser's cookies, so the download must leave them out too.
+    without_cookies: bool,
+}
+
+fn is_cookie(header: &(String, String)) -> bool {
+    header.0.eq_ignore_ascii_case("cookie")
 }
 
 /// A running download.
@@ -350,6 +369,7 @@ impl Engine {
                 settings: Mutex::new(settings),
                 installing: tokio::sync::Mutex::default(),
                 held: Mutex::default(),
+                media_cache: Mutex::default(),
             }),
         })
     }
@@ -382,32 +402,113 @@ impl Engine {
         })
     }
 
-    /// Finds the videos or sounds yt-dlp can download from the page at `url`.
+    /// Finds the videos or sounds yt-dlp can download from the page at `url`. An HLS or DASH
+    /// playlist is read directly, which takes a moment instead of seconds. What it found is
+    /// reused for a few minutes.
     pub async fn inspect_media(
         &self,
         url: &str,
         headers: &[(String, String)],
     ) -> Result<MediaInfo> {
-        let url = parse_url(url)?;
-        let dir = self.inner.config.tools_dir.as_deref();
-        let (ytdlp, _) = tools::ytdlp(dir).ok_or(Error::NoYtdlp)?;
-        media::inspect(&ytdlp, tools::ffmpeg(dir).is_some(), url.as_str(), headers).await
+        self.find_media(url, headers, false).await
     }
 
-    /// The yt-dlp and ffmpeg that media downloads would use.
+    /// Like [`Engine::inspect_media`], for a URL that a video player fetched as a playlist,
+    /// though it may not end in `.m3u8` or `.mpd`.
+    pub async fn inspect_stream(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<MediaInfo> {
+        self.find_media(url, headers, true).await
+    }
+
+    async fn find_media(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        stream: bool,
+    ) -> Result<MediaInfo> {
+        let url = parse_url(url)?;
+        let dir = self.inner.config.tools_dir.as_deref();
+        let ffmpeg = tools::ffmpeg(dir).is_some();
+        if let Some(found) = self.found_media(url.as_str(), ffmpeg) {
+            return Ok(found.0);
+        }
+        let read = if stream || playlist::looks_like_playlist(&url) {
+            match playlist::inspect(&self.inner.client, &url, headers, ffmpeg).await {
+                Err(Error::NotPlaylist) => None,
+                result => Some(result?),
+            }
+        } else {
+            None
+        };
+        let mut without_cookies = false;
+        let info = match read {
+            Some(info) => info,
+            None => self.ask_ytdlp(&url, headers, ffmpeg, &mut without_cookies).await?,
+        };
+        let mut cache = self.inner.media_cache.lock();
+        cache.retain(|f| f.url != url.as_str());
+        if cache.len() >= MEDIA_CACHE_SIZE {
+            cache.remove(0);
+        }
+        cache.push(FoundMedia {
+            url: url.to_string(),
+            at: Instant::now(),
+            info: info.clone(),
+            without_cookies,
+        });
+        Ok(info)
+    }
+
+    async fn ask_ytdlp(
+        &self,
+        url: &url::Url,
+        headers: &[(String, String)],
+        ffmpeg: bool,
+        without_cookies: &mut bool,
+    ) -> Result<MediaInfo> {
+        let dir = self.inner.config.tools_dir.as_deref();
+        let (ytdlp, _) = tools::ytdlp(dir).ok_or(Error::NoYtdlp)?;
+        match media::inspect(&ytdlp, dir, ffmpeg, url.as_str(), headers).await {
+            // Signed in, YouTube serves yt-dlp in ways it can only read with a JavaScript
+            // runtime, and without one it finds no formats at all. Signed out it finds them.
+            Err(Error::Media { message, .. })
+                if message.contains("Requested format is not available")
+                    && headers.iter().any(is_cookie) =>
+            {
+                tracing::info!("yt-dlp found no formats with cookies; trying without: {url}");
+                *without_cookies = true;
+                let headers: Vec<_> = headers.iter().filter(|h| !is_cookie(h)).cloned().collect();
+                media::inspect(&ytdlp, dir, ffmpeg, url.as_str(), &headers).await
+            }
+            result => result,
+        }
+    }
+
+    /// What yt-dlp found at `url` a short while ago, and whether that was without cookies.
+    fn found_media(&self, url: &str, ffmpeg: bool) -> Option<(MediaInfo, bool)> {
+        let mut cache = self.inner.media_cache.lock();
+        cache.retain(|f| f.at.elapsed() < MEDIA_CACHE_TIME);
+        // Installing ffmpeg since changes what can be offered.
+        cache
+            .iter()
+            .find(|f| f.url == url && f.info.ffmpeg == ffmpeg)
+            .map(|f| (f.info.clone(), f.without_cookies))
+    }
+
+    /// The yt-dlp, deno and ffmpeg that media downloads would use.
     pub async fn media_tools(&self) -> MediaTools {
         let dir = self.inner.config.tools_dir.as_deref();
-        let ytdlp = match tools::ytdlp(dir) {
-            Some((path, managed)) => match tools::version(&path).await {
-                Ok(version) => Some(Tool { path, version, managed }),
-                Err(e) => {
-                    tracing::warn!("checking yt-dlp at {}: {e}", path.display());
-                    None
-                }
-            },
-            None => None,
-        };
-        MediaTools { ytdlp, ffmpeg: tools::ffmpeg(dir) }
+        let (ytdlp, deno) = tokio::join!(tool(tools::ytdlp(dir)), tool(tools::deno(dir)));
+        MediaTools { ytdlp, deno, ffmpeg: tools::ffmpeg(dir) }
+    }
+
+    /// Whether the yt-dlp this engine installed is the single-file build, which takes seconds
+    /// to start each time. [`Engine::install_ytdlp`] replaces it with the quick one.
+    pub fn ytdlp_is_slow(&self) -> bool {
+        tools::ytdlp_is_single_file(self.inner.config.tools_dir.as_deref())
     }
 
     /// Installs the latest yt-dlp in [`Config::tools_dir`], or updates the copy there. Running
@@ -423,11 +524,29 @@ impl Engine {
         Ok(Tool { path, version, managed: true })
     }
 
+    /// Installs the latest deno in [`Config::tools_dir`], or updates the copy there.
+    pub async fn install_deno(&self) -> Result<Tool> {
+        let Some(dir) = self.inner.config.tools_dir.as_deref() else {
+            return Err(Error::Invalid("no folder was set up for deno".into()));
+        };
+        let _installing = self.inner.installing.lock().await;
+        let path = tools::install_deno(&self.inner.client, dir).await?;
+        let version = tools::version(&path).await?;
+        tracing::info!("installed {version}");
+        Ok(Tool { path, version: short_version(&version), managed: true })
+    }
+
     /// Probes the URL, picks a unique file name and records the download.
-    pub async fn add(&self, new: NewDownload) -> Result<DownloadId> {
+    pub async fn add(&self, mut new: NewDownload) -> Result<DownloadId> {
         let queue = new.queue.unwrap_or(QueueId::MAIN);
         self.queue(queue)?;
         let url = parse_url(&new.url)?;
+        if new.media.is_some() {
+            let ffmpeg = tools::ffmpeg(self.inner.config.tools_dir.as_deref()).is_some();
+            if let Some((_, true)) = self.found_media(url.as_str(), ffmpeg) {
+                new.headers.retain(|h| !is_cookie(h));
+            }
+        }
         let info = match new.media {
             // yt-dlp finds the file each time it runs; there is nothing to probe.
             Some(_) => probe::ProbeInfo { resumable: true, ..Default::default() },
@@ -872,6 +991,26 @@ impl Engine {
         }
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
+    }
+}
+
+/// A program found for media downloads, with its version, or `None` when it won't run.
+async fn tool(found: Option<(PathBuf, bool)>) -> Option<Tool> {
+    let (path, managed) = found?;
+    match tools::version(&path).await {
+        Ok(version) => Some(Tool { version: short_version(&version), path, managed }),
+        Err(e) => {
+            tracing::warn!("checking {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// `2.9.8` from deno's `deno 2.9.8 (stable, release, …)`. yt-dlp prints the version alone.
+fn short_version(text: &str) -> String {
+    match text.strip_prefix("deno ") {
+        Some(rest) => rest.split_whitespace().next().unwrap_or(rest).to_string(),
+        None => text.to_string(),
     }
 }
 

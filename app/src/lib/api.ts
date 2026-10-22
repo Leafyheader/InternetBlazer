@@ -105,6 +105,8 @@ export interface Tool {
 /** The programs video downloads use. */
 export interface MediaTools {
   ytdlp: Tool | null;
+  /** Runs YouTube's JavaScript for yt-dlp. Without it, YouTube offers fewer formats. */
+  deno: Tool | null;
   ffmpeg: string | null;
 }
 
@@ -176,6 +178,8 @@ export interface Incoming {
   url: string;
   fileName: string | null;
   headers: [string, string][];
+  /** The quality picked on the page, for a video. */
+  media: MediaFormat | null;
 }
 
 export const api = {
@@ -192,6 +196,7 @@ export const api = {
   mediaTools: () => invoke<MediaTools>("media_tools"),
   /** Installs or updates yt-dlp. */
   installYtdlp: () => invoke<Tool>("install_ytdlp"),
+  installDeno: () => invoke<Tool>("install_deno"),
   freeSpace: (dir: string) => invoke<number | null>("free_space", { dir }),
   add: (request: AddRequest) => invoke<number>("add_download", { request }),
   start: (id: number) => invoke<void>("start_download", { id }),

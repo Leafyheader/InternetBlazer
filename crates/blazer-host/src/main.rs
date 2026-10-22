@@ -31,6 +31,10 @@ enum Message {
     /// Reports whether the host is installed and the app is running, without starting it.
     Ping,
     Download(BrowserDownload),
+    Inspect(BrowserDownload),
+    /// Like `Inspect`, for a video that started playing, so the qualities are ready when the user
+    /// asks. Never starts the app.
+    Prefetch(BrowserDownload),
 }
 
 fn main() {
@@ -76,6 +80,11 @@ fn serve() -> io::Result<()> {
                 allow_focus();
                 json!(forward(Request::Download(download)))
             }
+            Ok(Message::Inspect(page)) => json!(forward(Request::Inspect(page))),
+            Ok(Message::Prefetch(page)) => match blazer_host::send(&Request::Inspect(page)) {
+                Ok(response) => json!(response),
+                Err(_) => json!({ "ok": false, "appRunning": false }),
+            },
             Err(e) => json!(Response::error(format!("bad message: {e}"))),
         };
         write_message(&mut stdout, &reply)?;

@@ -110,6 +110,12 @@ async fn install_ytdlp(engine: State<'_, Engine>) -> CmdResult<Tool> {
     engine.install_ytdlp().await.map_err(message)
 }
 
+/// Installs or updates deno, which yt-dlp needs for every YouTube format.
+#[tauri::command]
+async fn install_deno(engine: State<'_, Engine>) -> CmdResult<Tool> {
+    engine.install_deno().await.map_err(message)
+}
+
 /// `None` when the disk does not say, such as some network drives.
 #[tauri::command]
 async fn free_space(dir: PathBuf) -> Option<u64> {
@@ -507,6 +513,12 @@ fn main() {
                 if let Err(e) = resume.resume_interrupted() {
                     tracing::error!("resuming interrupted downloads: {e}");
                 }
+                // Earlier versions installed the yt-dlp that takes seconds to start.
+                if resume.ytdlp_is_slow()
+                    && let Err(e) = resume.install_ytdlp().await
+                {
+                    tracing::warn!("replacing yt-dlp with its quicker build: {e}");
+                }
             });
             app.manage(engine);
             app.manage(Bridge::default());
@@ -536,6 +548,7 @@ fn main() {
             inspect_media,
             media_tools,
             install_ytdlp,
+            install_deno,
             free_space,
             add_download,
             start_download,

@@ -15,7 +15,6 @@ use std::{
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::Command,
     time::{self, Instant, MissedTickBehavior},
 };
 use tokio_util::sync::CancellationToken;
@@ -41,17 +40,17 @@ const MAX_FRAGMENT_CONNECTIONS: usize = 8;
 /// Finds the videos on a page with `yt-dlp -J`, which prints what it found as JSON.
 pub(crate) async fn inspect(
     ytdlp: &Path,
+    tools_dir: Option<&Path>,
     ffmpeg: bool,
     url: &str,
     headers: &[(String, String)],
 ) -> Result<MediaInfo> {
-    let mut cmd = Command::new(ytdlp);
+    let mut cmd = tools::ytdlp_command(ytdlp, tools_dir);
     cmd.args(["--ignore-config", "--no-playlist", "--encoding", "utf-8", "-J"])
         .args(header_args(headers))
         .arg("--")
         .arg(url)
-        .stdin(Stdio::null())
-        .env("PYTHONUTF8", "1");
+        .stdin(Stdio::null());
     let output = Tree::output(&mut cmd).await?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -500,12 +499,11 @@ async fn attempt(
         .connections
         .unwrap_or_else(|| inner.connections())
         .clamp(1, MAX_FRAGMENT_CONNECTIONS);
-    let mut cmd = Command::new(ytdlp);
+    let mut cmd = tools::ytdlp_command(ytdlp, cfg.tools_dir.as_deref());
     cmd.args(args(record, format, ffmpeg, limit, connections))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("PYTHONUTF8", "1");
+        .stderr(Stdio::piped());
     let mut tree = Tree::spawn(&mut cmd).map_err(|e| Error::Media {
         message: format!("could not start yt-dlp: {e}"),
         retryable: false,

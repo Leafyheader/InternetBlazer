@@ -20,6 +20,7 @@ mod filename;
 mod fsio;
 mod limit;
 mod media;
+mod playlist;
 mod probe;
 mod queue;
 mod segment;

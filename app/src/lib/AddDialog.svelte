@@ -25,8 +25,9 @@
   // svelte-ignore state_referenced_locally
   let url = $state(prefill?.url ?? "");
   let dir = $state("");
+  // A video's name follows the quality picked here, which may change its extension.
   // svelte-ignore state_referenced_locally
-  let fileName = $state(prefill?.fileName ?? "");
+  let fileName = $state((prefill?.media ? null : prefill?.fileName) ?? "");
   let connections = $state(8);
   let touchedConnections = false;
   // svelte-ignore state_referenced_locally
@@ -49,7 +50,13 @@
   let stage = $state("");
   let chosen = $derived(media?.choices[choice] ?? null);
   /** A title is no path, though it may hold slashes, as in "AC/DC". */
-  let videoName = $derived(media && chosen ? `${media.title.replace(/[\\/]/g, "_")}.${chosen.ext}` : null);
+  // The browser names a video after its page, which for a stream beats yt-dlp's "index".
+  let videoStem = $derived(
+    prefill?.media && prefill.fileName && url.trim() === prefill.url
+      ? prefill.fileName.replace(/\.[^.]*$/, "")
+      : (media?.title.replace(/[\\/]/g, "_") ?? ""),
+  );
+  let videoName = $derived(media && chosen ? `${videoStem}.${chosen.ext}` : null);
   let size = $derived(media ? (chosen?.size ?? null) : (info?.total ?? null));
   /** Bytes free where the file goes, or null when unknown. */
   let free = $state<number | null>(null);
@@ -97,12 +104,16 @@
           // Sites that turn away plain requests, as with a bot check, may still let yt-dlp in.
           page = true;
         }
-        if (!page) return;
+        // A video's HLS or DASH playlist is a small file of its own, but it stands for the video.
+        const playlist = /\.(m3u8|mpd)([?#]|$)/i.test(target) || (prefill?.media && target === prefill.url);
+        if (!page && !playlist) return;
         const found = await findMedia(target, headers, (s) => !stale && (stage = s));
         if (stale) return;
         if (found.choices.length > 0) {
           media = found;
-          choice = 0;
+          // The quality picked on the page, if the link is still that page.
+          const picked = target === prefill?.url ? JSON.stringify(prefill.media) : null;
+          choice = Math.max(0, found.choices.findIndex((c) => JSON.stringify(c.format) === picked));
           checkError = "";
         } else {
           mediaError = found.ffmpeg

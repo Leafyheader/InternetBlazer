@@ -62,6 +62,8 @@ pub enum Error {
     Media { message: String, retryable: bool },
     #[error("video downloads need yt-dlp, which is not installed")]
     NoYtdlp,
+    #[error("the link does not lead to an HLS or DASH playlist")]
+    NotPlaylist,
     #[error("internal error: {0}")]
     Internal(String),
 }

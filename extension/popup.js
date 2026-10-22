@@ -33,6 +33,7 @@ async function showAccess() {
 async function showSettings() {
   const settings = await loadSettings();
   $("enabled").checked = settings.enabled;
+  $("video-button").checked = settings.videoButton;
   $("file-types").value = settings.fileTypes;
   showReset(settings.fileTypes);
 }
@@ -54,6 +55,10 @@ $("grant").addEventListener("click", async () => {
 
 $("enabled").addEventListener("change", (e) => {
   chrome.storage.local.set({ enabled: e.target.checked });
+});
+
+$("video-button").addEventListener("change", (e) => {
+  chrome.storage.local.set({ videoButton: e.target.checked });
 });
 
 // Saved while typing: the popup closes, without a change event, when it loses focus.

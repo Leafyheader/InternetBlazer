@@ -5,6 +5,8 @@ const HOST = "org.internetblazer.host";
 const DEFAULT_SETTINGS = {
   /** Whether matching browser downloads go to the app. */
   enabled: true,
+  /** Whether videos get a "Download video" button. */
+  videoButton: true,
   /** File name extensions to take over, separated by spaces. */
   fileTypes:
     "zip rar 7z gz tgz bz2 xz lz lzma zst tar cab iso img bin cue " +

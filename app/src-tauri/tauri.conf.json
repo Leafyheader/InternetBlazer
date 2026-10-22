@@ -14,10 +14,11 @@
       {
         "label": "main",
         "title": "InternetBlazer",
-        "width": 1100,
-        "height": 700,
+        "width": 920,
+        "height": 580,
         "minWidth": 760,
         "minHeight": 480,
+        "center": true,
         "visible": false
       }
     ],
