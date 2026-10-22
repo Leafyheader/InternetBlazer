@@ -121,7 +121,7 @@ pub(crate) async fn run(
                 Some(p) if record.downloaded() <= before => p.attempt + 1,
                 _ => 1,
             };
-            if e.is_retryable() && attempt <= inner.config.auto_retries {
+            if e.is_retryable() && attempt <= inner.auto_retries() {
                 let delay = retry_delay(&inner.config, attempt, e.retry_after());
                 tracing::info!(%id, "retrying in {delay:?} (attempt {attempt}) after: {e}");
                 record.status = Status::Retrying;
@@ -202,7 +202,7 @@ async fn execute(
         .map_err(Error::internal)??;
     let ranged = record.resumable && record.total.is_some();
     let worker_count = match ranged {
-        true => record.connections.unwrap_or(cfg.connections).clamp(1, MAX_CONNECTIONS),
+        true => record.connections.unwrap_or_else(|| inner.connections()).clamp(1, MAX_CONNECTIONS),
         false => 1,
     };
     let plan = if record.segments.is_empty() {

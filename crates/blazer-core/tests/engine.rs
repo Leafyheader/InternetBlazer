@@ -19,7 +19,8 @@ use axum::{
     routing::get,
 };
 use blazer_core::{
-    Config, DownloadId, Engine, Event, NewDownload, Queue, QueueId, RedbStore, Status, Store,
+    Config, DownloadId, Engine, Event, MAX_CONNECTIONS, NewDownload, Queue, QueueId, RedbStore,
+    Settings, Status, Store,
 };
 use bytes::Bytes;
 use tokio::sync::broadcast::error::RecvError;
@@ -765,6 +766,30 @@ async fn fails_once_the_automatic_retries_run_out() {
     assert_eq!(record.status, Status::Failed);
     assert!(record.error.unwrap().contains("server had a problem"));
     assert_eq!(record.retry, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_settings_override_the_config() {
+    let server = Server::new(64 * 1024);
+    server.error_responses.store(usize::MAX, Ordering::Relaxed);
+    let (_server, url) = server.spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open_retrying(tmp.path(), 1000);
+    let settings =
+        Settings { auto_retries: Some(0), connections: Some(1000), ..Settings::default() };
+    engine.set_settings(settings).unwrap();
+
+    // Fails at once rather than retrying a thousand times.
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    let record = settle(&engine, id).await;
+    assert_eq!(record.status, Status::Failed);
+    engine.shutdown().await;
+    drop(engine);
+
+    let engine = open_retrying(tmp.path(), 1000);
+    let saved = engine.settings().unwrap();
+    assert_eq!(saved.auto_retries, Some(0));
+    assert_eq!(saved.connections, Some(MAX_CONNECTIONS), "brought into range");
 }
 
 #[tokio::test(flavor = "multi_thread")]

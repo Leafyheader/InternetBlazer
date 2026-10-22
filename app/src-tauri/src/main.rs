@@ -10,18 +10,28 @@
 
 mod bridge;
 mod icons;
+mod prefs;
+mod tray;
 
 use std::path::PathBuf;
 
 use anyhow::Context;
 use blazer_core::{
-    Config, DownloadId, DownloadRecord, Engine, LinkInfo, NewDownload, Queue, QueueId, Settings,
+    Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, NewDownload, Queue, QueueId,
+    Settings, Status,
 };
 use bridge::{Bridge, Incoming};
+use prefs::{Prefs, PrefsStore};
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State, ipc::Response};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, ipc::Response};
+use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::sync::broadcast::error::RecvError;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Passed by the login item, which starts the app in the tray.
+const HIDDEN_ARG: &str = "--hidden";
 
 /// Commands report errors to the UI as plain messages.
 type CmdResult<T> = Result<T, String>;
@@ -54,8 +64,15 @@ async fn get_download(engine: State<'_, Engine>, id: DownloadId) -> CmdResult<Do
     engine.get(id).map_err(message)
 }
 
+/// The folder the add dialog starts in.
 #[tauri::command]
-fn default_dir() -> Option<PathBuf> {
+fn default_dir(prefs: State<'_, PrefsStore>) -> Option<PathBuf> {
+    prefs.get().target_dir()
+}
+
+/// Where downloads go when the user hasn't picked a folder.
+#[tauri::command]
+fn system_download_dir() -> Option<PathBuf> {
     dirs::download_dir()
 }
 
@@ -76,14 +93,23 @@ async fn free_space(dir: PathBuf) -> Option<u64> {
 }
 
 #[tauri::command]
-async fn add_download(engine: State<'_, Engine>, request: AddRequest) -> CmdResult<DownloadId> {
+async fn add_download(
+    engine: State<'_, Engine>,
+    prefs: State<'_, PrefsStore>,
+    request: AddRequest,
+) -> CmdResult<DownloadId> {
+    let dir = request.dir.clone();
     let mut new = NewDownload::new(request.url.trim(), request.dir);
     new.file_name = request.file_name.filter(|name| !name.trim().is_empty());
     new.connections = request.connections;
     new.queue = request.queue;
     new.start = request.start;
     new.headers = request.headers;
-    engine.add(new).await.map_err(message)
+    let id = engine.add(new).await.map_err(message)?;
+    if let Err(e) = prefs.update(|p| p.last_dir = Some(dir)) {
+        tracing::warn!("saving the last folder used: {e:#}");
+    }
+    Ok(id)
 }
 
 // Commands that start downloads must be async: the engine spawns tasks on the tokio runtime,
@@ -166,9 +192,58 @@ async fn stop_queue(engine: State<'_, Engine>, id: QueueId) -> CmdResult<()> {
     engine.stop_queue(id).map_err(message)
 }
 
+/// The engine's settings, with those left unset filled in from its configuration.
 #[tauri::command]
 async fn get_settings(engine: State<'_, Engine>) -> CmdResult<Settings> {
-    engine.settings().map_err(message)
+    let settings = engine.settings().map_err(message)?;
+    let config = engine.config();
+    Ok(Settings {
+        connections: settings.connections.or(Some(config.connections)),
+        auto_retries: settings.auto_retries.or(Some(config.auto_retries)),
+        ..settings
+    })
+}
+
+#[tauri::command]
+async fn set_settings(engine: State<'_, Engine>, settings: Settings) -> CmdResult<()> {
+    engine.set_settings(settings).map_err(message)
+}
+
+#[tauri::command]
+fn get_prefs(prefs: State<'_, PrefsStore>) -> Prefs {
+    prefs.get()
+}
+
+/// Leaves alone what the app keeps track of itself.
+#[tauri::command]
+fn set_prefs(prefs: State<'_, PrefsStore>, new: Prefs) -> CmdResult<()> {
+    prefs
+        .update(|p| {
+            *p =
+                Prefs { last_dir: p.last_dir.take(), tray_notice_shown: p.tray_notice_shown, ..new }
+        })
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn get_launch_at_login(app: AppHandle) -> CmdResult<bool> {
+    app.autolaunch().is_enabled().map_err(message)
+}
+
+#[tauri::command]
+fn set_launch_at_login(app: AppHandle, enabled: bool) -> CmdResult<()> {
+    let autolaunch = app.autolaunch();
+    match enabled {
+        true => autolaunch.enable(),
+        false => autolaunch.disable(),
+    }
+    .map_err(message)
+}
+
+#[tauri::command]
+fn open_log_folder(app: AppHandle) -> CmdResult<()> {
+    let dir = log_dir().map_err(message)?;
+    app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(message)
 }
 
 #[tauri::command]
@@ -219,21 +294,92 @@ async fn file_icon(
     Ok(Response::new(png))
 }
 
+fn data_dir() -> anyhow::Result<PathBuf> {
+    Ok(dirs::data_local_dir().context("no local data directory")?.join("InternetBlazer"))
+}
+
 /// Shares its state with the `blazer` CLI. redb allows one process at a time, so the CLI cannot
 /// run while the app is open.
 fn db_path() -> anyhow::Result<PathBuf> {
-    Ok(dirs::data_local_dir()
-        .context("no local data directory")?
-        .join("InternetBlazer")
-        .join("state.redb"))
+    Ok(data_dir()?.join("state.redb"))
+}
+
+fn log_dir() -> anyhow::Result<PathBuf> {
+    Ok(data_dir()?.join("logs"))
+}
+
+/// Logs to the console and to a file a day, keeping a week of them. `RUST_LOG` overrides the
+/// level.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Written directly rather than from a background thread: the event loop ends the process
+    // without running destructors, which would lose the last lines of a buffered writer.
+    let file = log_dir().and_then(|dir| {
+        Ok(tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("internetblazer")
+            .filename_suffix("log")
+            .max_log_files(7)
+            .build(dir)?)
+    });
+    let file = file.inspect_err(|e| eprintln!("logging to a file: {e:#}")).ok();
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(file.map(|file| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file)))
+        .init();
+    // Panics would otherwise only reach the console, which release builds don't have.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("{info}");
+        default_hook(info);
+    }));
+}
+
+/// Shows a desktop notification, unless the user turned them off or is looking at the app.
+pub(crate) fn notify(app: &AppHandle, title: &str, body: String) {
+    let focused = app.get_webview_window("main").is_some_and(|w| w.is_focused().unwrap_or(false));
+    if focused || !app.state::<PrefsStore>().get().notify {
+        return;
+    }
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        tracing::warn!("showing a notification: {e}");
+    }
+}
+
+fn notify_status(
+    app: &AppHandle,
+    engine: &Engine,
+    id: DownloadId,
+    status: Status,
+    error: Option<&str>,
+) {
+    if !matches!(status, Status::Completed | Status::Failed) {
+        return;
+    }
+    let Ok(record) = engine.get(id) else { return };
+    match status {
+        Status::Completed => notify(app, "Download complete", record.file_name),
+        _ => {
+            let error = error.unwrap_or("unknown error");
+            notify(app, "Download failed", format!("{}: {error}", record.file_name));
+        }
+    }
 }
 
 fn forward_events(app: AppHandle, engine: &Engine) {
     let mut events = engine.subscribe();
+    let engine = engine.clone();
+    let mut activity = tray::Activity::default();
     tauri::async_runtime::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(event) => {
+                    activity.observe(&app, &event);
+                    if let Event::StatusChanged { id, status, error } = &event {
+                        notify_status(&app, &engine, *id, *status, error.as_deref());
+                    }
                     let _ = app.emit("download-event", event);
                 }
                 Err(RecvError::Lagged(_)) => {
@@ -245,10 +391,34 @@ fn forward_events(app: AppHandle, engine: &Engine) {
     });
 }
 
+/// Hides the window instead of closing it when the app should stay in the tray. Tells the user
+/// the first time, so the app doesn't seem to have quit while downloads carry on.
+fn close_to_tray(window: &tauri::Window) -> bool {
+    let prefs = window.state::<PrefsStore>();
+    let current = prefs.get();
+    if !current.close_to_tray {
+        return false;
+    }
+    let _ = window.hide();
+    if !current.tray_notice_shown {
+        let shown = window
+            .notification()
+            .builder()
+            .title("InternetBlazer is still running")
+            .body("Downloads carry on in the background. To quit, right-click the tray icon and choose Quit.")
+            .show();
+        if let Err(e) = shown {
+            tracing::warn!("showing the tray notice: {e}");
+        }
+        if let Err(e) = prefs.update(|p| p.tray_notice_shown = true) {
+            tracing::warn!("saving that the tray notice was shown: {e:#}");
+        }
+    }
+    true
+}
+
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_logging();
 
     // Already running: show that window instead. The second copy could not open the store anyway.
     if blazer_host::send(&blazer_host::Request::Show).is_ok_and(|r| r.ok) {
@@ -258,8 +428,11 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_autostart::Builder::new().arg(HIDDEN_ARG).build())
         .setup(|app| {
             let db = db_path()?;
+            app.manage(PrefsStore::open(data_dir()?.join("app.json")));
             let engine = Engine::open(&db, Config::default())
                 .with_context(|| format!("opening {}", db.display()))?;
             forward_events(app.handle().clone(), &engine);
@@ -275,12 +448,26 @@ fn main() {
             app.manage(Bridge::default());
             bridge::serve(app.handle().clone());
             bridge::register_host();
+            tray::create(app.handle())?;
+            // The window starts hidden, so that starting at login doesn't flash it.
+            if !std::env::args().any(|arg| arg == HIDDEN_ARG) {
+                bridge::show_window(app.handle());
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == "main"
+                && close_to_tray(window)
+            {
+                api.prevent_close();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             list_downloads,
             get_download,
             default_dir,
+            system_download_dir,
             inspect_link,
             free_space,
             add_download,
@@ -298,7 +485,13 @@ fn main() {
             start_queue,
             stop_queue,
             get_settings,
+            set_settings,
             set_speed_limit,
+            get_prefs,
+            set_prefs,
+            get_launch_at_login,
+            set_launch_at_login,
+            open_log_folder,
             take_browser_downloads,
             open_file,
             show_in_folder,
@@ -306,13 +499,17 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("failed to start InternetBlazer")
-        .run(|app, event| {
+        .run(|app, event| match event {
             // Lets running downloads checkpoint their progress before the process ends.
-            if let RunEvent::Exit = event
-                && let Some(engine) = app.try_state::<Engine>()
-            {
-                let engine = engine.inner().clone();
-                tauri::async_runtime::block_on(engine.shutdown());
+            RunEvent::Exit => {
+                if let Some(engine) = app.try_state::<Engine>() {
+                    let engine = engine.inner().clone();
+                    tauri::async_runtime::block_on(engine.shutdown());
+                }
             }
+            // Clicking the dock icon of a hidden app.
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => bridge::show_window(app),
+            _ => {}
         });
 }

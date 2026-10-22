@@ -1,16 +1,19 @@
 //! Serves requests from the browser extension, which `blazer-host` forwards over a local socket.
 //!
-//! A browser download is not added right away: it waits in [`Bridge`] until the UI takes it and
-//! shows it in the add dialog, so the user picks where it goes. `browser-download` tells the UI
-//! that one is waiting.
+//! A browser download normally waits in [`Bridge`] until the UI takes it and shows it in the add
+//! dialog, so the user picks where it goes; `browser-download` tells the UI that one is waiting.
+//! Users can turn that off, and then it starts right away in the usual folder.
 
 use std::path::PathBuf;
 
+use blazer_core::{Engine, NewDownload};
 use blazer_host::{BrowserDownload, MAX_REQUEST, Request, Response};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+
+use crate::prefs::PrefsStore;
 
 /// A download from the browser, as the add dialog fills it in.
 #[derive(Debug, Clone, Serialize)]
@@ -51,12 +54,45 @@ fn handle(app: &AppHandle, request: Request) -> Response {
             }
             let headers = download.headers();
             let BrowserDownload { url, file_name, .. } = download;
-            app.state::<Bridge>().pending.lock().push(Incoming { url, file_name, headers });
-            let _ = app.emit("browser-download", ());
-            show_window(app);
+            let incoming = Incoming { url, file_name, headers };
+            let prefs = app.state::<PrefsStore>().get();
+            match prefs.target_dir().filter(|_| !prefs.confirm_browser_downloads) {
+                Some(dir) => {
+                    tauri::async_runtime::spawn(add_now(app.clone(), incoming, dir));
+                }
+                None => confirm(app, incoming),
+            }
         }
     }
     Response::ok()
+}
+
+/// Waits for the user to confirm the download in the add dialog.
+fn confirm(app: &AppHandle, incoming: Incoming) {
+    app.state::<Bridge>().pending.lock().push(incoming);
+    let _ = app.emit("browser-download", ());
+    show_window(app);
+}
+
+/// Adds the download without asking. One that can't be added goes to the add dialog instead,
+/// which shows why.
+async fn add_now(app: AppHandle, incoming: Incoming, dir: PathBuf) {
+    let mut new = NewDownload::new(&incoming.url, dir);
+    new.file_name = incoming.file_name.clone();
+    new.headers = incoming.headers.clone();
+    let engine = app.state::<Engine>();
+    match engine.add(new).await {
+        Ok(id) => {
+            // The download left the browser without a trace there, so say where it went.
+            if let Ok(record) = engine.get(id) {
+                crate::notify(&app, "Downloading", record.file_name);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("adding a browser download: {e}");
+            confirm(&app, incoming);
+        }
+    }
 }
 
 async fn respond(app: AppHandle, stream: impl AsyncRead + AsyncWrite + Unpin) {

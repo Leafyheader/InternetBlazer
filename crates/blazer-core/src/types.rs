@@ -150,6 +150,12 @@ pub struct LinkInfo {
 pub struct Settings {
     /// Bytes per second across all downloads.
     pub speed_limit: Option<u64>,
+    /// Connections for downloads that don't set their own. `None` uses the engine's
+    /// [`Config`](crate::Config).
+    pub connections: Option<usize>,
+    /// Automatic retries of a download that failed for a temporary reason. `None` uses the
+    /// engine's [`Config`](crate::Config).
+    pub auto_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -85,9 +85,26 @@ export interface Queue {
 
 export const MAIN_QUEUE = 0;
 
+/** The engine's settings, shared with the CLI. */
 export interface Settings {
   /** Bytes per second across all downloads. */
   speedLimit: number | null;
+  /** For downloads that don't set their own. `get_settings` always fills it in. */
+  connections: number | null;
+  /** Times a download that failed for a temporary reason is tried again. Always filled in by `get_settings`. */
+  autoRetries: number | null;
+}
+
+/** Settings of the desktop app itself. */
+export interface Prefs {
+  /** Null uses the system's Downloads folder. */
+  downloadDir: string | null;
+  /** New downloads go to the folder used last instead of `downloadDir`. */
+  rememberLastDir: boolean;
+  /** Browser downloads wait in the add dialog instead of starting right away. */
+  confirmBrowserDownloads: boolean;
+  closeToTray: boolean;
+  notify: boolean;
 }
 
 export type EngineEvent =
@@ -120,7 +137,10 @@ export interface Incoming {
 export const api = {
   list: () => invoke<DownloadRecord[]>("list_downloads"),
   get: (id: number) => invoke<DownloadRecord>("get_download", { id }),
+  /** The folder the add dialog starts in. */
   defaultDir: () => invoke<string | null>("default_dir"),
+  /** The system's Downloads folder. */
+  systemDownloadDir: () => invoke<string | null>("system_download_dir"),
   inspect: (url: string, headers: [string, string][]) =>
     invoke<LinkInfo>("inspect_link", { url, headers }),
   freeSpace: (dir: string) => invoke<number | null>("free_space", { dir }),
@@ -141,7 +161,13 @@ export const api = {
   startQueue: (id: number) => invoke<void>("start_queue", { id }),
   stopQueue: (id: number) => invoke<void>("stop_queue", { id }),
   settings: () => invoke<Settings>("get_settings"),
+  setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   setSpeedLimit: (limit: number | null) => invoke<void>("set_speed_limit", { limit }),
+  prefs: () => invoke<Prefs>("get_prefs"),
+  setPrefs: (prefs: Prefs) => invoke<void>("set_prefs", { new: prefs }),
+  launchAtLogin: () => invoke<boolean>("get_launch_at_login"),
+  setLaunchAtLogin: (enabled: boolean) => invoke<void>("set_launch_at_login", { enabled }),
+  openLogFolder: () => invoke<void>("open_log_folder"),
   takeBrowserDownloads: () => invoke<Incoming[]>("take_browser_downloads"),
   openFile: (id: number) => invoke<void>("open_file", { id }),
   showInFolder: (id: number) => invoke<void>("show_in_folder", { id }),

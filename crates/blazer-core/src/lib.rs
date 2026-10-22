@@ -22,7 +22,7 @@ mod sniff;
 mod store;
 mod types;
 
-pub use engine::{Config, Engine, MAX_CONNECTIONS, NewDownload};
+pub use engine::{Config, Engine, MAX_AUTO_RETRIES, MAX_CONNECTIONS, NewDownload};
 pub use error::{Error, Result};
 pub use limit::MIN_SPEED_LIMIT;
 pub use queue::{ALL_DAYS, Queue, Schedule};

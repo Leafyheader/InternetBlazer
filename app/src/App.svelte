@@ -20,6 +20,7 @@
   import Icon from "./lib/Icon.svelte";
   import QueueDialog from "./lib/QueueDialog.svelte";
   import RemoveDialog from "./lib/RemoveDialog.svelte";
+  import SettingsDialog from "./lib/SettingsDialog.svelte";
   import SpeedLimitDialog from "./lib/SpeedLimitDialog.svelte";
   import UrlDialog from "./lib/UrlDialog.svelte";
   import { clock } from "./lib/clock.svelte";
@@ -38,6 +39,7 @@
   let limitDialog = $state<"global" | Item | null>(null);
   /** The download whose address is being changed. */
   let urlDialog = $state<Item | null>(null);
+  let settingsOpen = $state(false);
   let toast = $state("");
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -137,7 +139,9 @@
   }
 
   function onkeydown(e: KeyboardEvent) {
-    if (adding || incoming.length > 0 || removing || queueDialog || limitDialog || urlDialog) return;
+    if (adding || incoming.length > 0 || removing || queueDialog || limitDialog || urlDialog || settingsOpen) {
+      return;
+    }
     const target = e.target as HTMLElement;
     if (target.closest("input, textarea, select, dialog")) return;
     const ctrl = e.ctrlKey || e.metaKey;
@@ -214,6 +218,9 @@
         </button>
       {/each}
     </nav>
+    <button class="filter settings" onclick={() => (settingsOpen = true)}>
+      <span class="queue-name"><Icon name="settings" size={16} />Settings</span>
+    </button>
   </aside>
 
   <main>
@@ -407,6 +414,9 @@
 {/if}
 {#if urlDialog}
   <UrlDialog item={urlDialog} onclose={() => (urlDialog = null)} />
+{/if}
+{#if settingsOpen}
+  <SettingsDialog onclose={() => (settingsOpen = false)} />
 {/if}
 {#if removing}
   <RemoveDialog items={removing} onclose={() => (removing = null)} />

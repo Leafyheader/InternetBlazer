@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub const MAX_CONNECTIONS: usize = 32;
+pub const MAX_AUTO_RETRIES: u32 = 100;
 const EVENT_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
@@ -126,6 +127,8 @@ pub(crate) struct Inner {
     records: Mutex<()>,
     /// The global limit, shared by every connection of every download.
     pub(crate) speed_limit: RateLimiter,
+    /// The stored settings. Held while they are saved, so concurrent changes don't undo each other.
+    settings: Mutex<Settings>,
 }
 
 /// A running download.
@@ -139,6 +142,15 @@ impl Inner {
     pub(crate) fn emit(&self, event: Event) {
         // Sending only fails when nobody is subscribed.
         let _ = self.events.send(event);
+    }
+
+    /// Connections for a download that doesn't ask for a number itself.
+    pub(crate) fn connections(&self) -> usize {
+        self.settings.lock().connections.unwrap_or(self.config.connections)
+    }
+
+    pub(crate) fn auto_retries(&self) -> u32 {
+        self.settings.lock().auto_retries.unwrap_or(self.config.auto_retries)
     }
 
     pub(crate) fn deactivate(&self, id: DownloadId) {
@@ -294,7 +306,8 @@ impl Engine {
         if !store.queues()?.iter().any(|q| q.id == QueueId::MAIN) {
             store.save_queue(&Queue::main())?;
         }
-        let speed_limit = RateLimiter::new(store.settings()?.speed_limit);
+        let settings = store.settings()?;
+        let speed_limit = RateLimiter::new(settings.speed_limit);
         let client = reqwest::Client::builder()
             .user_agent(&config.user_agent)
             .connect_timeout(config.connect_timeout)
@@ -313,6 +326,7 @@ impl Engine {
                 sched: Mutex::default(),
                 records: Mutex::default(),
                 speed_limit,
+                settings: Mutex::new(settings),
             }),
         })
     }
@@ -601,14 +615,35 @@ impl Engine {
     }
 
     pub fn settings(&self) -> Result<Settings> {
-        self.inner.store.settings()
+        Ok(self.inner.settings.lock().clone())
+    }
+
+    /// The configuration the engine was opened with, which settings left unset fall back to.
+    pub fn config(&self) -> &Config {
+        &self.inner.config
+    }
+
+    /// Saves and applies `settings`. Values out of range are brought into it.
+    pub fn set_settings(&self, settings: Settings) -> Result<()> {
+        self.update_settings(|s| *s = settings)
     }
 
     /// Limits all downloads together, in bytes per second. `None` removes the limit.
     pub fn set_speed_limit(&self, limit: Option<u64>) -> Result<()> {
-        let settings = Settings { speed_limit: limit::normalize(limit) };
+        self.update_settings(|s| s.speed_limit = limit)
+    }
+
+    fn update_settings(&self, change: impl FnOnce(&mut Settings)) -> Result<()> {
+        let mut current = self.inner.settings.lock();
+        let mut settings = current.clone();
+        change(&mut settings);
+        settings.speed_limit = limit::normalize(settings.speed_limit);
+        settings.connections = settings.connections.map(|n| n.clamp(1, MAX_CONNECTIONS));
+        settings.auto_retries = settings.auto_retries.map(|n| n.min(MAX_AUTO_RETRIES));
         self.inner.store.save_settings(&settings)?;
         self.inner.speed_limit.set(settings.speed_limit);
+        *current = settings.clone();
+        // Sent while still holding the lock, so listeners see changes in the order they were made.
         self.inner.emit(Event::SettingsChanged(settings));
         Ok(())
     }

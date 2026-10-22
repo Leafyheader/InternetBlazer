@@ -57,6 +57,16 @@ The app and the CLI share one download list, stored in your local app data folde
 
 The sidebar lists the queues: select one to start, stop or configure it. "Move to queue" in the toolbar moves the selected downloads. The speed limit for all downloads is in the status bar, and a single download's limit is in its details.
 
+Closing the window keeps the app running in the tray, so downloads carry on. Click the tray icon to bring the window back, or right-click it to pause everything or quit. Its tooltip shows how many downloads are running and how fast.
+
+Settings, at the bottom of the sidebar:
+
+- **Downloads:** the default folder, or whether to start in the folder used last; connections per download; how many automatic retries a download gets. The connections and retries settings are shared with the CLI.
+- **Browser:** whether files from the extension wait in the download dialog or start right away in the default folder.
+- **Desktop:** starting at sign-in (hidden in the tray), keeping the app in the tray when the window is closed, and notifications when downloads finish or fail while the window is in the background.
+
+The app keeps a log for each day, for a week, in the `logs` folder next to the download list. "Open log folder" in Settings shows it. Set `RUST_LOG=debug` for more detail.
+
 Shortcuts: Ctrl+N adds a download, Delete removes the selection, Enter opens a finished file or resumes a paused one, Ctrl+A selects all.
 
 ## Browser extension

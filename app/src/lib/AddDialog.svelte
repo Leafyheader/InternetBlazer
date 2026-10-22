@@ -17,14 +17,13 @@
     prefill?: Incoming;
   } = $props();
 
-  const LAST_DIR_KEY = "lastDir";
-
   // svelte-ignore state_referenced_locally
   let url = $state(prefill?.url ?? "");
-  let dir = $state(readLastDir());
+  let dir = $state("");
   // svelte-ignore state_referenced_locally
   let fileName = $state(prefill?.fileName ?? "");
   let connections = $state(8);
+  let touchedConnections = false;
   // svelte-ignore state_referenced_locally
   let queue = $state(initialQueue);
   let start = $state(true);
@@ -83,17 +82,13 @@
     };
   });
 
-  function readLastDir(): string {
-    try {
-      return localStorage.getItem(LAST_DIR_KEY) ?? "";
-    } catch {
-      return "";
-    }
-  }
-
   onMount(() => {
     dialog.showModal();
-    if (!dir) api.defaultDir().then((d) => (dir ||= d ?? ""));
+    // Only fills in what the user hasn't typed yet.
+    api.defaultDir().then((d) => (dir ||= d ?? ""));
+    api.settings().then((s) => {
+      if (!touchedConnections && s.connections !== null) connections = s.connections;
+    });
   });
 
   async function browse() {
@@ -115,9 +110,6 @@
         start,
         headers: prefill?.headers ?? [],
       });
-      try {
-        localStorage.setItem(LAST_DIR_KEY, dir);
-      } catch {}
       onclose();
     } catch (err) {
       error = String(err);
@@ -183,7 +175,14 @@
       </label>
       <label>
         <span>Connections</span>
-        <input type="number" bind:value={connections} min="1" max="32" class="narrow" />
+        <input
+          type="number"
+          bind:value={connections}
+          oninput={() => (touchedConnections = true)}
+          min="1"
+          max="32"
+          class="narrow"
+        />
       </label>
     </div>
 

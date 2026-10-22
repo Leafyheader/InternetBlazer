@@ -180,6 +180,9 @@ button.link:hover:not(:disabled) {
   color: #fff;
   background: linear-gradient(135deg, #ff8a3d, #e5322d);
 }
+.sidebar .settings {
+  margin-top: auto;
+}
 .sidebar .add {
   justify-content: center;
   padding: 8px;

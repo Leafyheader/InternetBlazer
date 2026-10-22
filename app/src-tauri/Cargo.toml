@@ -21,8 +21,11 @@ png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+tauri-plugin-autostart.workspace = true
 tauri-plugin-dialog.workspace = true
+tauri-plugin-notification.workspace = true
 tauri-plugin-opener.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
