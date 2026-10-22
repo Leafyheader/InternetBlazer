@@ -1,7 +1,13 @@
 //! The public engine API: adding, starting, pausing and observing downloads, and managing queues
 //! and speed limits.
 
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use parking_lot::Mutex;
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -10,12 +16,16 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use crate::{
     download,
     error::{Error, Result},
-    filename,
+    filename, fsio,
     limit::{self, RateLimiter},
-    probe,
+    media, probe,
     queue::{self, Queue},
     store::{RedbStore, Store},
-    types::{self, DownloadId, DownloadRecord, Event, LinkInfo, QueueId, Retry, Settings, Status},
+    tools,
+    types::{
+        self, DownloadId, DownloadRecord, Event, LinkInfo, MediaFormat, MediaInfo, MediaTools,
+        QueueId, Retry, Settings, Status, Tool,
+    },
 };
 
 pub const MAX_CONNECTIONS: usize = 32;
@@ -49,6 +59,9 @@ pub struct Config {
     /// How often progress is flushed to disk and saved to the store.
     pub checkpoint_interval: Duration,
     pub user_agent: String,
+    /// Where [`Engine::install_ytdlp`] puts yt-dlp, and where yt-dlp and ffmpeg are looked for
+    /// before `PATH`. Without it, yt-dlp cannot be installed.
+    pub tools_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -69,6 +82,7 @@ impl Default for Config {
             progress_interval: Duration::from_millis(250),
             checkpoint_interval: Duration::from_secs(1),
             user_agent: concat!("InternetBlazer/", env!("CARGO_PKG_VERSION")).to_string(),
+            tools_dir: None,
         }
     }
 }
@@ -86,6 +100,8 @@ pub struct NewDownload {
     pub queue: Option<QueueId>,
     /// Bytes per second.
     pub speed_limit: Option<u64>,
+    /// Downloads the video or sound on the page at `url` with yt-dlp, instead of the file there.
+    pub media: Option<MediaFormat>,
     /// Queue it to start instead of adding it paused.
     pub start: bool,
 }
@@ -100,6 +116,7 @@ impl NewDownload {
             headers: Vec::new(),
             queue: None,
             speed_limit: None,
+            media: None,
             start: true,
         }
     }
@@ -129,6 +146,10 @@ pub(crate) struct Inner {
     pub(crate) speed_limit: RateLimiter,
     /// The stored settings. Held while they are saved, so concurrent changes don't undo each other.
     settings: Mutex<Settings>,
+    /// Held while yt-dlp is installed, so two installs don't replace each other's files.
+    installing: tokio::sync::Mutex<()>,
+    /// Downloads whose files are being moved, which must not start until they are in place.
+    held: Mutex<HashSet<DownloadId>>,
 }
 
 /// A running download.
@@ -327,6 +348,8 @@ impl Engine {
                 records: Mutex::default(),
                 speed_limit,
                 settings: Mutex::new(settings),
+                installing: tokio::sync::Mutex::default(),
+                held: Mutex::default(),
             }),
         })
     }
@@ -355,7 +378,49 @@ impl Engine {
             file_name: info.file_name.map(|name| filename::sanitize(&name)),
             total: info.total,
             resumable: info.resumable,
+            page: info.html,
         })
+    }
+
+    /// Finds the videos or sounds yt-dlp can download from the page at `url`.
+    pub async fn inspect_media(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<MediaInfo> {
+        let url = parse_url(url)?;
+        let dir = self.inner.config.tools_dir.as_deref();
+        let (ytdlp, _) = tools::ytdlp(dir).ok_or(Error::NoYtdlp)?;
+        media::inspect(&ytdlp, tools::ffmpeg(dir).is_some(), url.as_str(), headers).await
+    }
+
+    /// The yt-dlp and ffmpeg that media downloads would use.
+    pub async fn media_tools(&self) -> MediaTools {
+        let dir = self.inner.config.tools_dir.as_deref();
+        let ytdlp = match tools::ytdlp(dir) {
+            Some((path, managed)) => match tools::version(&path).await {
+                Ok(version) => Some(Tool { path, version, managed }),
+                Err(e) => {
+                    tracing::warn!("checking yt-dlp at {}: {e}", path.display());
+                    None
+                }
+            },
+            None => None,
+        };
+        MediaTools { ytdlp, ffmpeg: tools::ffmpeg(dir) }
+    }
+
+    /// Installs the latest yt-dlp in [`Config::tools_dir`], or updates the copy there. Running
+    /// downloads keep the copy they started with.
+    pub async fn install_ytdlp(&self) -> Result<Tool> {
+        let Some(dir) = self.inner.config.tools_dir.as_deref() else {
+            return Err(Error::Invalid("no folder was set up for yt-dlp".into()));
+        };
+        let _installing = self.inner.installing.lock().await;
+        let path = tools::install_ytdlp(&self.inner.client, dir).await?;
+        let version = tools::version(&path).await?;
+        tracing::info!("installed yt-dlp {version}");
+        Ok(Tool { path, version, managed: true })
     }
 
     /// Probes the URL, picks a unique file name and records the download.
@@ -363,21 +428,41 @@ impl Engine {
         let queue = new.queue.unwrap_or(QueueId::MAIN);
         self.queue(queue)?;
         let url = parse_url(&new.url)?;
-        let info = probe::probe(&self.inner.client, url.as_str(), &new.headers).await?;
+        let info = match new.media {
+            // yt-dlp finds the file each time it runs; there is nothing to probe.
+            Some(_) => probe::ProbeInfo { resumable: true, ..Default::default() },
+            None => probe::probe(&self.inner.client, url.as_str(), &new.headers).await?,
+        };
 
-        let suggested = new.file_name.as_deref().or(info.file_name.as_deref());
-        let name = filename::sanitize(suggested.unwrap_or("download"));
+        let name = match (new.media, new.file_name.as_deref()) {
+            (_, Some(name)) => filename::sanitize(name),
+            (Some(format), None) => {
+                let found = self.inspect_media(url.as_str(), &new.headers).await?;
+                media::guess_name(&found, format)
+            }
+            (None, None) => filename::sanitize(info.file_name.as_deref().unwrap_or("download")),
+        };
         let in_progress: Vec<PathBuf> = self
             .list()?
             .into_iter()
             .filter(|r| r.status != Status::Completed)
             .map(|r| r.path())
             .collect();
-        let file_name = filename::unique(&new.dir, &name, |path| {
-            path.exists()
-                || filename::part_path(path).exists()
-                || in_progress.iter().any(|p| p == path)
-        });
+        let file_name = match new.media {
+            // yt-dlp names its files after the stem and may choose another extension, so no
+            // other file may share the stem.
+            Some(_) => filename::unique(&new.dir, &name, |path| {
+                media::stem_taken(path)
+                    || in_progress
+                        .iter()
+                        .any(|p| p.parent() == path.parent() && media::same_stem(p, path))
+            }),
+            None => filename::unique(&new.dir, &name, |path| {
+                path.exists()
+                    || filename::part_path(path).exists()
+                    || in_progress.iter().any(|p| p == path)
+            }),
+        };
 
         let id = self.inner.store.next_id()?;
         let record = DownloadRecord {
@@ -393,6 +478,7 @@ impl Engine {
             connections: new.connections,
             queue,
             speed_limit: limit::normalize(new.speed_limit),
+            media: new.media,
             segments: Vec::new(),
             status: if new.start { Status::Queued } else { Status::Paused },
             error: None,
@@ -413,6 +499,11 @@ impl Engine {
     /// queue has a free slot.
     pub fn start(&self, id: DownloadId) -> Result<()> {
         self.get(id)?;
+        if self.inner.held.lock().contains(&id) {
+            return Err(Error::Invalid(
+                "the download is being moved; start it once that's done".into(),
+            ));
+        }
         self.enqueue(|r| r.id == id)
     }
 
@@ -441,6 +532,7 @@ impl Engine {
             for record in self.list()? {
                 if matches!(record.status, Status::Paused | Status::Failed | Status::Retrying)
                     && !self.is_active(record.id)
+                    && !self.inner.held.lock().contains(&record.id)
                     && pick(&record)
                 {
                     self.inner.set_status(record.id, Status::Queued)?;
@@ -493,7 +585,15 @@ impl Engine {
     pub async fn restart(&self, id: DownloadId) -> Result<()> {
         self.pause(id);
         let record = self.wait(id).await?;
-        let info = probe::probe(&self.inner.client, &record.url, &record.headers).await?;
+        let info = match record.media {
+            Some(_) => {
+                for path in media::working_files(&record) {
+                    remove_if_exists(&path)?;
+                }
+                probe::ProbeInfo { resumable: true, ..Default::default() }
+            }
+            None => probe::probe(&self.inner.client, &record.url, &record.headers).await?,
+        };
         {
             let _sched = self.inner.sched.lock();
             self.inner.update(id, |r| {
@@ -520,8 +620,13 @@ impl Engine {
     pub async fn set_url(&self, id: DownloadId, url: &str) -> Result<()> {
         let url = parse_url(url)?;
         let record = self.get(id)?;
-        let info = probe::probe(&self.inner.client, url.as_str(), &record.headers).await?;
-        let started = record.downloaded() > 0;
+        let info = match record.media {
+            // yt-dlp looks at the page again each time it runs.
+            Some(_) => probe::ProbeInfo { resumable: true, ..Default::default() },
+            None => probe::probe(&self.inner.client, url.as_str(), &record.headers).await?,
+        };
+        // yt-dlp's partial files belong to the video rather than the address, so they are kept.
+        let started = record.media.is_none() && record.downloaded() > 0;
         if started {
             let size = |n: Option<u64>| n.map_or("unknown".into(), crate::fsio::format_bytes);
             if info.total != record.total {
@@ -570,6 +675,39 @@ impl Engine {
         Ok(())
     }
 
+    /// Moves or renames a download that is not running: the finished file, or the partial data a
+    /// paused or failed download carries on from. Never replaces another file.
+    pub async fn move_to(&self, id: DownloadId, dir: PathBuf, file_name: &str) -> Result<()> {
+        let name = filename::sanitize(file_name);
+        let moves = {
+            let _sched = self.inner.sched.lock();
+            let record = self.get(id)?;
+            if self.is_active(id) || matches!(record.status, Status::Queued | Status::Retrying) {
+                return Err(Error::Invalid("pause the download before moving it".into()));
+            }
+            let target =
+                DownloadRecord { dir: dir.clone(), file_name: name.clone(), ..record.clone() };
+            let moves = planned_moves(&record, &target)?;
+            if !self.inner.held.lock().insert(id) {
+                return Err(Error::Invalid("the download is already being moved".into()));
+            }
+            moves
+        };
+        let result = async {
+            tokio::task::spawn_blocking(move || move_all(&moves))
+                .await
+                .map_err(Error::internal)??;
+            self.inner.update(id, |r| {
+                r.dir = dir;
+                r.file_name = name;
+            })
+        }
+        .await;
+        self.inner.held.lock().remove(&id);
+        self.inner.emit(Event::Updated(result?));
+        Ok(())
+    }
+
     /// Stops and forgets a download. With `delete_files`, also deletes its partial data and, if
     /// it completed, the downloaded file.
     pub async fn remove(&self, id: DownloadId, delete_files: bool) -> Result<()> {
@@ -577,6 +715,9 @@ impl Engine {
         let record = self.wait(id).await?;
         self.inner.store.delete(id)?;
         if delete_files {
+            for path in media::working_files(&record) {
+                remove_if_exists(&path)?;
+            }
             remove_if_exists(&record.part_path())?;
             if record.status == Status::Completed {
                 remove_if_exists(&record.path())?;
@@ -747,10 +888,85 @@ fn parse_url(url: &str) -> Result<url::Url> {
 /// before renaming, which makes this check possible.
 fn finished_on_disk(record: &DownloadRecord) -> bool {
     let Some(total) = record.total else { return false };
-    !record.segments.is_empty()
+    // Running yt-dlp again finds its finished file, and the file's name with it.
+    record.media.is_none()
+        && !record.segments.is_empty()
         && record.downloaded() == total
         && !record.part_path().exists()
         && std::fs::metadata(record.path()).is_ok_and(|m| m.is_file() && m.len() == total)
+}
+
+/// The files to move so that the download `from` becomes `to`, as `(from, to)` pairs.
+fn planned_moves(from: &DownloadRecord, to: &DownloadRecord) -> Result<Vec<(PathBuf, PathBuf)>> {
+    if from.path() == to.path() {
+        return Ok(Vec::new());
+    }
+    let moves = if from.status == Status::Completed {
+        if !from.path().is_file() {
+            return Err(Error::Invalid(format!(
+                "the file is no longer at {}",
+                from.path().display()
+            )));
+        }
+        vec![(from.path(), to.path())]
+    } else if from.media.is_some() {
+        let (old, new) = (media::stem(&from.file_name), media::stem(&to.file_name));
+        // Only the guessed extension changes, which yt-dlp decides anyway.
+        if old == new && from.dir == to.dir {
+            return Ok(Vec::new());
+        }
+        if media::stem_taken(&to.path()) {
+            return Err(taken(&to.file_name));
+        }
+        media::working_files(from)
+            .into_iter()
+            .filter_map(|path| {
+                let name = path.file_name()?.to_string_lossy().into_owned();
+                let rest = name.strip_prefix(old)?;
+                Some((path.clone(), to.dir.join(format!("{new}{rest}"))))
+            })
+            .collect()
+    } else {
+        if to.path().exists() && !same_file_name(&from.path(), &to.path()) {
+            return Err(taken(&to.file_name));
+        }
+        let part = from.part_path();
+        if part.exists() { vec![(part, to.part_path())] } else { Vec::new() }
+    };
+    for (source, target) in &moves {
+        if target.exists() && !same_file_name(source, target) {
+            return Err(taken(&target.file_name().unwrap_or_default().to_string_lossy()));
+        }
+    }
+    Ok(moves)
+}
+
+/// Paths that differ only in case, which some file systems treat as the same file.
+fn same_file_name(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+fn taken(name: &str) -> Error {
+    Error::Invalid(format!("“{name}” already exists in that folder"))
+}
+
+/// Moves the files, or none of them: if one fails, those already moved go back.
+fn move_all(moves: &[(PathBuf, PathBuf)]) -> Result<()> {
+    for (i, (source, target)) in moves.iter().enumerate() {
+        let moved = target
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| fsio::move_new(source, target));
+        if let Err(e) = moved {
+            for (source, target) in moves[..i].iter().rev() {
+                if let Err(e) = fsio::move_new(target, source) {
+                    tracing::error!("could not move {} back: {e}", target.display());
+                }
+            }
+            return Err(e.into());
+        }
+    }
+    Ok(())
 }
 
 /// Checks a queue before it is saved, and trims its name.

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { clock } from "./clock.svelte";
   import { downloads, retryIn, STATUS_LABELS, type Item } from "./downloads.svelte";
-  import { bytes, date, duration } from "./format";
+  import { bytes, date, duration, quality } from "./format";
 
   let {
     item,
@@ -55,16 +55,22 @@
         · <span class="warn">reconnecting</span>
       {:else if item.status === "downloading" && item.stalled}
         · <span class="warn">no data arriving</span>
-      {:else if item.status === "downloading"}
+      {:else if item.status === "downloading" && !item.media}
         · {item.activeConnections} connections
       {/if}
       {#if item.status === "retrying" && item.retry}
         · attempt {item.retry.attempt}, {wait ? `in ${duration(wait)}` : "starting"}
       {/if}
     </dd>
+    {#if item.media}
+      <dt>Video</dt>
+      <dd>{quality(item.media)} · downloaded by yt-dlp</dd>
+    {/if}
     <dt>Resume</dt>
     <dd>
-      {#if item.resumable}
+      {#if item.media}
+        Supported · yt-dlp carries on where it stopped
+      {:else if item.resumable}
         Supported · pausing keeps what's downloaded
       {:else}
         <span class="warn">Not supported</span> · pausing or a lost connection starts over

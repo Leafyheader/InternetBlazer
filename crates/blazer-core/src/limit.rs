@@ -42,6 +42,10 @@ impl RateLimiter {
         bucket.last = Instant::now();
     }
 
+    pub(crate) fn limit(&self) -> Option<u64> {
+        self.0.lock().rate
+    }
+
     /// Accounts for `n` received bytes and waits until the limit allows more.
     pub(crate) async fn take(&self, n: usize) {
         let mut wait = self.consume(n as f64);

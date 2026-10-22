@@ -8,18 +8,24 @@
 //!
 //! Started downloads wait in a [`Queue`] that runs a limited number at a time, and can be
 //! limited in speed, each and all together.
+//!
+//! Videos and sounds on web pages are downloaded by yt-dlp instead, which the engine runs, can
+//! install, and schedules like any other download.
 
+mod child;
 mod download;
 mod engine;
 mod error;
 mod filename;
 mod fsio;
 mod limit;
+mod media;
 mod probe;
 mod queue;
 mod segment;
 mod sniff;
 mod store;
+mod tools;
 mod types;
 
 pub use engine::{Config, Engine, MAX_AUTO_RETRIES, MAX_CONNECTIONS, NewDownload};
@@ -29,7 +35,8 @@ pub use queue::{ALL_DAYS, Queue, Schedule};
 pub use segment::Segment;
 pub use store::{RedbStore, Store};
 pub use types::{
-    DownloadId, DownloadRecord, Event, LinkInfo, Progress, QueueId, Retry, Settings, Status,
+    DownloadId, DownloadRecord, Event, LinkInfo, MediaChoice, MediaFormat, MediaInfo, MediaTools,
+    Progress, QueueId, Retry, Settings, Status, Tool,
 };
 
 /// Bytes free for this user on the disk that would hold `path`, which need not exist yet.

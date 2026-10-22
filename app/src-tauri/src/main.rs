@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use blazer_core::{
-    Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, NewDownload, Queue, QueueId,
-    Settings, Status,
+    Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, MediaFormat, MediaInfo,
+    MediaTools, NewDownload, Queue, QueueId, Settings, Status, Tool,
 };
 use bridge::{Bridge, Incoming};
 use prefs::{Prefs, PrefsStore};
@@ -52,6 +52,9 @@ struct AddRequest {
     /// Passed on from the browser.
     #[serde(default)]
     headers: Vec<(String, String)>,
+    /// The video on the page to download, rather than the page.
+    #[serde(default)]
+    media: Option<MediaFormat>,
 }
 
 #[tauri::command]
@@ -86,6 +89,27 @@ async fn inspect_link(
     engine.inspect(url.trim(), &headers).await.map_err(message)
 }
 
+/// The videos on a web page and the qualities they come in.
+#[tauri::command]
+async fn inspect_media(
+    engine: State<'_, Engine>,
+    url: String,
+    headers: Vec<(String, String)>,
+) -> CmdResult<MediaInfo> {
+    engine.inspect_media(url.trim(), &headers).await.map_err(message)
+}
+
+#[tauri::command]
+async fn media_tools(engine: State<'_, Engine>) -> CmdResult<MediaTools> {
+    Ok(engine.media_tools().await)
+}
+
+/// Installs or updates yt-dlp.
+#[tauri::command]
+async fn install_ytdlp(engine: State<'_, Engine>) -> CmdResult<Tool> {
+    engine.install_ytdlp().await.map_err(message)
+}
+
 /// `None` when the disk does not say, such as some network drives.
 #[tauri::command]
 async fn free_space(dir: PathBuf) -> Option<u64> {
@@ -105,6 +129,7 @@ async fn add_download(
     new.queue = request.queue;
     new.start = request.start;
     new.headers = request.headers;
+    new.media = request.media;
     let id = engine.add(new).await.map_err(message)?;
     if let Err(e) = prefs.update(|p| p.last_dir = Some(dir)) {
         tracing::warn!("saving the last folder used: {e:#}");
@@ -265,6 +290,39 @@ async fn open_file(app: AppHandle, engine: State<'_, Engine>, id: DownloadId) ->
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(message)
 }
 
+/// Shows the system's "Open with" dialog for a finished download. Windows only; the UI offers it
+/// nowhere else.
+#[tauri::command]
+async fn open_with(engine: State<'_, Engine>, id: DownloadId) -> CmdResult<()> {
+    let path = engine.get(id).map_err(message)?.path();
+    if !path.is_file() {
+        return Err(format!("the file is no longer at {}", path.display()));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // rundll32 passes the rest of the line on as the path, so it must not be quoted.
+        std::process::Command::new("rundll32.exe")
+            .raw_arg(format!("shell32.dll,OpenAs_RunDLL {}", path.display()))
+            .spawn()
+            .map(drop)
+            .map_err(message)
+    }
+    #[cfg(not(windows))]
+    Err("“Open with” is only available on Windows".into())
+}
+
+/// Moves or renames a finished download's file, or a paused one's partial data.
+#[tauri::command]
+async fn move_download(
+    engine: State<'_, Engine>,
+    id: DownloadId,
+    dir: PathBuf,
+    file_name: String,
+) -> CmdResult<()> {
+    engine.move_to(id, dir, &file_name).await.map_err(message)
+}
+
 /// Shows the file in the system file manager, or its folder while it is still downloading.
 #[tauri::command]
 async fn show_in_folder(
@@ -302,6 +360,11 @@ fn data_dir() -> anyhow::Result<PathBuf> {
 /// run while the app is open.
 fn db_path() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join("state.redb"))
+}
+
+/// Holds the yt-dlp the app installs, shared with the CLI.
+fn tools_dir() -> anyhow::Result<PathBuf> {
+    Ok(data_dir()?.join("tools"))
 }
 
 fn log_dir() -> anyhow::Result<PathBuf> {
@@ -433,8 +496,9 @@ fn main() {
         .setup(|app| {
             let db = db_path()?;
             app.manage(PrefsStore::open(data_dir()?.join("app.json")));
-            let engine = Engine::open(&db, Config::default())
-                .with_context(|| format!("opening {}", db.display()))?;
+            let config = Config { tools_dir: Some(tools_dir()?), ..Config::default() };
+            let engine =
+                Engine::open(&db, config).with_context(|| format!("opening {}", db.display()))?;
             forward_events(app.handle().clone(), &engine);
             tauri::async_runtime::spawn(engine.clone().run_scheduler());
             // Picks up where the app left off when it quit or crashed.
@@ -469,6 +533,9 @@ fn main() {
             default_dir,
             system_download_dir,
             inspect_link,
+            inspect_media,
+            media_tools,
+            install_ytdlp,
             free_space,
             add_download,
             start_download,
@@ -494,6 +561,8 @@ fn main() {
             open_log_folder,
             take_browser_downloads,
             open_file,
+            open_with,
+            move_download,
             show_in_folder,
             file_icon,
         ])

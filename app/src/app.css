@@ -656,3 +656,104 @@ dialog footer {
 .toast span {
   overflow-wrap: anywhere;
 }
+
+/* Context menu */
+
+.context-menu {
+  position: fixed;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  min-width: 210px;
+  max-width: 320px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  outline: none;
+  user-select: none;
+}
+.context-menu > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px 6px 6px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--text);
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+  cursor: default;
+}
+.context-menu > button:focus-visible,
+.context-menu > button:focus,
+.context-menu > button.expanded {
+  outline: none;
+  background: var(--hover);
+}
+.context-menu > button:disabled {
+  color: var(--muted);
+  opacity: 0.6;
+}
+.context-menu > button.danger:not(:disabled) {
+  color: var(--danger);
+}
+.context-menu .mark {
+  display: inline-flex;
+  justify-content: center;
+  width: 18px;
+  flex: none;
+  color: var(--muted);
+}
+.context-menu > button.danger .mark {
+  color: inherit;
+}
+.context-menu .label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-menu .key,
+.context-menu .arrow {
+  color: var(--muted);
+  font-size: 12px;
+}
+.context-menu .arrow {
+  font-size: 15px;
+  line-height: 1;
+}
+.context-menu .separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+
+/* The details panel, shown in the properties dialog. */
+dialog.properties {
+  width: min(640px, calc(100vw - 32px));
+}
+dialog.properties .details {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+dialog .title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* Text whose full value, such as a long path, shows on hover. */
+.path {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}
+/* Long unbroken text, such as a path, wraps instead of widening the dialog. */
+dialog {
+  overflow-wrap: anywhere;
+}

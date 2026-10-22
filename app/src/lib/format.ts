@@ -1,3 +1,5 @@
+import type { MediaFormat } from "./api";
+
 const UNITS = ["B", "KB", "MB", "GB", "TB"];
 
 export function bytes(n: number): string {
@@ -53,4 +55,10 @@ export function clock(minutes: number): string {
 export function minutes(clock: string): number {
   const [h, m] = clock.split(":").map(Number);
   return (h || 0) * 60 + (m || 0);
+}
+
+/** The quality a video download asked for. */
+export function quality(format: MediaFormat): string {
+  if (format.type === "audio") return "Audio only";
+  return format.maxHeight === null ? "Best available" : `Up to ${format.maxHeight}p`;
 }

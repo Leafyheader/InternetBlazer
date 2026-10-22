@@ -2,7 +2,7 @@
 
 A fast, open-source, cross-platform download manager written in Rust: an IDM alternative with a modern UI.
 
-> **Status:** Phase 4. The download engine, a CLI, the desktop app (with queues, a scheduler and speed limits) and a browser extension work. Video downloads with yt-dlp come next.
+> **Status:** Phase 5. The download engine, a CLI, the desktop app (with queues, a scheduler and speed limits), a browser extension and video downloads with yt-dlp work. Packaging comes next.
 
 ## Features (engine)
 
@@ -21,6 +21,7 @@ A fast, open-source, cross-platform download manager written in Rust: an IDM alt
 - **Queues.** Started downloads wait in a queue that runs a set number at a time, oldest first. You can add your own queues and move downloads between them.
 - **Scheduler.** A queue can start and stop at set times on chosen weekdays (local time), for example overnight. A stop time at or before the start time means the next day. Schedules run only while the desktop app is open.
 - **Speed limits.** One limit for all downloads together, plus an optional limit per download. Both can be changed while downloads run.
+- **Videos from web pages.** For a link to a page with a video, such as on YouTube, [yt-dlp](https://github.com/yt-dlp/yt-dlp) finds the video and the qualities it comes in, and downloads it. These downloads queue, pause, resume and retry like any other. yt-dlp is installed on first use from its official release, after checking the release's published SHA-256, and can be updated from Settings; a copy on `PATH` also works. Sites like YouTube keep picture and sound apart, and joining them needs [ffmpeg](https://ffmpeg.org) on `PATH` (on Windows: `winget install ffmpeg`). Without it, only the sound or qualities that come in one file are offered.
 
 ## Layout
 
@@ -31,8 +32,6 @@ A fast, open-source, cross-platform download manager written in Rust: an IDM alt
 | `crates/blazer-host` | `blazer-host`, which connects the browser extension to the app |
 | `app/` | Desktop app: Svelte 5 frontend in `app/src`, Tauri 2 shell in `app/src-tauri` |
 | `extension/` | Browser extension for Chrome, Edge, Brave and Firefox (Manifest V3, no build step) |
-
-Planned: yt-dlp video support.
 
 ## Build
 
@@ -55,6 +54,8 @@ npm run check                              # type-check the frontend
 
 The app and the CLI share one download list, stored in your local app data folder. Only one of them can have it open at a time. Starting the app while it runs brings its window to the front. Downloads that were running or queued when the app last quit or crashed start again when it opens. The CLI never starts them on its own.
 
+Right-click a download for Open, Open with (Windows), Show in folder, Resume or Pause, Download again, Move / rename (which also moves a paused download's partial data), Add to queue, Remove and Properties. Shift+F10 or the menu key opens it for the selection. The browser's own menu, with Reload and Inspect, is gone; text fields keep cut, copy and paste. Release builds also ignore browser shortcuts such as F5 and Ctrl+R.
+
 The sidebar lists the queues: select one to start, stop or configure it. "Move to queue" in the toolbar moves the selected downloads. The speed limit for all downloads is in the status bar, and a single download's limit is in its details.
 
 Closing the window keeps the app running in the tray, so downloads carry on. Click the tray icon to bring the window back, or right-click it to pause everything or quit. Its tooltip shows how many downloads are running and how fast.
@@ -62,6 +63,7 @@ Closing the window keeps the app running in the tray, so downloads carry on. Cli
 Settings, at the bottom of the sidebar:
 
 - **Downloads:** the default folder, or whether to start in the folder used last; connections per download; how many automatic retries a download gets. The connections and retries settings are shared with the CLI.
+- **Video downloads:** the yt-dlp version, with a button to update it, and whether ffmpeg was found.
 - **Browser:** whether files from the extension wait in the download dialog or start right away in the default folder.
 - **Desktop:** starting at sign-in (hidden in the tray), keeping the app in the tray when the window is closed, and notifications when downloads finish or fail while the window is in the background.
 
@@ -92,6 +94,8 @@ If a download cannot reach the app, the browser downloads it after all and the t
 
 ```sh
 blazer get <URL> [-d DIR] [-o NAME] [-c CONNECTIONS] [-l LIMIT]   # Ctrl+C pauses
+blazer get <PAGE-URL> -m best|audio|720     # the video on a page, with yt-dlp
+blazer tools [--update]                     # show yt-dlp and ffmpeg; install or update yt-dlp
 blazer list
 blazer set-url <ID> <URL>                   # a fresh link for the same file; keeps progress
 blazer limit [RATE|off]                     # e.g. 500K or 2M; shared with the app

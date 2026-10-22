@@ -25,7 +25,7 @@ use crate::{
     error::{Error, Result},
     filename, fsio,
     limit::RateLimiter,
-    probe,
+    media, probe,
     segment::{Claim, Plan},
     sniff,
     types::{self, DownloadId, DownloadRecord, Event, Progress, Retry, Status},
@@ -94,7 +94,10 @@ pub(crate) async fn run(
     let before = record.downloaded();
     let previous = record.retry.take();
     let mut retry_in = None;
-    let mut result = execute(&inner, &mut record, &cancel, limiter.clone()).await;
+    let mut result = match record.media {
+        Some(_) => media::execute(&inner, &mut record, &cancel, limiter.clone()).await,
+        None => execute(&inner, &mut record, &cancel, limiter.clone()).await,
+    };
     if matches!(result, Err(Error::RangeOverflow)) {
         // Some CDNs give byte ranges the size of a compressed copy while sending the real file.
         // A plain request for the whole file, which such servers get right, is the way out.

@@ -10,13 +10,15 @@ use crate::{
     filename,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ProbeInfo {
     pub total: Option<u64>,
     pub resumable: bool,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub file_name: Option<String>,
+    /// The server sent a web page, not a file.
+    pub html: bool,
 }
 
 impl ProbeInfo {
@@ -60,12 +62,17 @@ pub(crate) async fn probe(
     let file_name = header_str(h, header::CONTENT_DISPOSITION)
         .and_then(|cd| filename::from_content_disposition(&cd))
         .or_else(|| filename::from_url(resp.url()));
+    let html = header_str(h, header::CONTENT_TYPE).is_some_and(|t| {
+        let t = t.trim_start().to_ascii_lowercase();
+        t.starts_with("text/html") || t.starts_with("application/xhtml")
+    });
     Ok(ProbeInfo {
         total,
         resumable,
         etag: header_str(h, header::ETAG),
         last_modified: header_str(h, header::LAST_MODIFIED),
         file_name,
+        html,
     })
 }
 

@@ -1,7 +1,12 @@
+<script module lang="ts">
+  /** Set once yt-dlp is known to be there, so later dialogs skip asking. */
+  let ytdlpReady = false;
+</script>
+
 <script lang="ts">
   import { open as pickFolder } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { api, type Incoming, type LinkInfo, MAIN_QUEUE } from "./api";
+  import { api, type Incoming, type LinkInfo, MAIN_QUEUE, type MediaInfo } from "./api";
   import { downloads } from "./downloads.svelte";
   import { bytes } from "./format";
   import Icon from "./Icon.svelte";
@@ -35,9 +40,33 @@
   let info = $state<LinkInfo | null>(null);
   let checking = $state(false);
   let checkError = $state("");
+  /** Videos found on the page the link leads to. */
+  let media = $state<MediaInfo | null>(null);
+  let mediaError = $state("");
+  /** Index into `media.choices`. */
+  let choice = $state(0);
+  /** What the check is doing, when it takes a while. */
+  let stage = $state("");
+  let chosen = $derived(media?.choices[choice] ?? null);
+  /** A title is no path, though it may hold slashes, as in "AC/DC". */
+  let videoName = $derived(media && chosen ? `${media.title.replace(/[\\/]/g, "_")}.${chosen.ext}` : null);
+  let size = $derived(media ? (chosen?.size ?? null) : (info?.total ?? null));
   /** Bytes free where the file goes, or null when unknown. */
   let free = $state<number | null>(null);
-  let tooBig = $derived(info?.total != null && free !== null && info.total > free);
+  let tooBig = $derived(size !== null && free !== null && size > free);
+
+  /** Finds the videos on a page, getting yt-dlp first if it isn't there yet. */
+  async function findMedia(target: string, headers: [string, string][], report: (s: string) => void) {
+    if (!ytdlpReady) {
+      if (!(await api.mediaTools()).ytdlp) {
+        report("Getting yt-dlp, which downloads videos…");
+        await api.installYtdlp();
+      }
+      ytdlpReady = true;
+    }
+    report("Looking for videos on the page…");
+    return api.inspectMedia(target, headers);
+  }
 
   // Checks the link once typing pauses. An answer for an address that has changed since is
   // dropped. Only `url` and `prefill` may be read here: reading state this effect sets, such
@@ -48,17 +77,45 @@
     const valid = /^https?:\/\/\S+$/i.test(target);
     info = null;
     checkError = "";
+    media = null;
+    mediaError = "";
+    stage = "";
     checking = valid;
     if (!valid) return;
     let stale = false;
     const timer = setTimeout(async () => {
       try {
-        const result = await api.inspect(target, headers);
-        if (!stale) info = result;
+        let page: boolean;
+        try {
+          const result = await api.inspect(target, headers);
+          if (stale) return;
+          info = result;
+          page = result.page;
+        } catch (err) {
+          if (stale) return;
+          checkError = String(err);
+          // Sites that turn away plain requests, as with a bot check, may still let yt-dlp in.
+          page = true;
+        }
+        if (!page) return;
+        const found = await findMedia(target, headers, (s) => !stale && (stage = s));
+        if (stale) return;
+        if (found.choices.length > 0) {
+          media = found;
+          choice = 0;
+          checkError = "";
+        } else {
+          mediaError = found.ffmpeg
+            ? "yt-dlp found the video but no way to download it."
+            : "This video comes as separate picture and sound, which need ffmpeg to be joined. Install ffmpeg (on Windows: winget install ffmpeg), then check the link again.";
+        }
       } catch (err) {
-        if (!stale) checkError = String(err);
+        if (!stale) mediaError = String(err);
       } finally {
-        if (!stale) checking = false;
+        if (!stale) {
+          checking = false;
+          stage = "";
+        }
       }
     }, 400);
     return () => {
@@ -104,11 +161,13 @@
       await api.add({
         url: url.trim(),
         dir,
-        fileName: fileName.trim() || null,
+        // Named here for a video, so adding it doesn't ask yt-dlp about the page again.
+        fileName: fileName.trim() || videoName,
         connections: Math.min(32, Math.max(1, Math.round(connections))),
         queue,
         start,
         headers: prefill?.headers ?? [],
+        media: chosen?.format ?? null,
       });
       onclose();
     } catch (err) {
@@ -141,7 +200,15 @@
       />
       <span class="link-info" aria-live="polite">
         {#if checking}
-          <span class="muted">Checking link…</span>
+          <span class="muted">{stage || "Checking link…"}</span>
+        {:else if media}
+          <span>{media.site ? `${media.site} video` : "Video"}: {media.title}</span>
+        {:else if mediaError}
+          <span class="warn">
+            {mediaError.startsWith("Unsupported URL")
+              ? "This is a web page, not a file, and yt-dlp found no video on it."
+              : mediaError}
+          </span>
         {:else if info}
           <span>{info.total === null ? "Size unknown" : bytes(info.total)}</span>
           {#if info.resumable}
@@ -154,6 +221,25 @@
         {/if}
       </span>
     </label>
+
+    {#if media}
+      <label>
+        <span>Quality</span>
+        <select bind:value={choice}>
+          {#each media.choices as c, i (i)}
+            <option value={i}>
+              {c.label} · {c.ext.toUpperCase()}{c.size === null ? "" : ` · about ${bytes(c.size)}`}
+            </option>
+          {/each}
+        </select>
+        {#if !media.ffmpeg}
+          <span class="link-info warn">
+            ffmpeg isn't installed, so only qualities that come in one file are offered. Install
+            ffmpeg (on Windows: winget install ffmpeg) for the rest.
+          </span>
+        {/if}
+      </label>
+    {/if}
 
     <label>
       <span>Save to</span>
@@ -171,7 +257,7 @@
     <div class="inline">
       <label class="grow">
         <span>File name</span>
-        <input bind:value={fileName} placeholder={info?.fileName ?? "Use the name from the server"} spellcheck="false" />
+        <input bind:value={fileName} placeholder={videoName ?? info?.fileName ?? "Use the name from the server"} spellcheck="false" />
       </label>
       <label>
         <span>Connections</span>

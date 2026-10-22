@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import AddDialog from "./lib/AddDialog.svelte";
+  import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import { api, type Incoming, MAIN_QUEUE, onBrowserDownload, type Queue } from "./lib/api";
   import Details from "./lib/Details.svelte";
   import FileIcon from "./lib/FileIcon.svelte";
@@ -18,6 +19,8 @@
   } from "./lib/downloads.svelte";
   import { bytes, duration } from "./lib/format";
   import Icon from "./lib/Icon.svelte";
+  import MoveDialog from "./lib/MoveDialog.svelte";
+  import PropertiesDialog from "./lib/PropertiesDialog.svelte";
   import QueueDialog from "./lib/QueueDialog.svelte";
   import RemoveDialog from "./lib/RemoveDialog.svelte";
   import SettingsDialog from "./lib/SettingsDialog.svelte";
@@ -40,6 +43,12 @@
   /** The download whose address is being changed. */
   let urlDialog = $state<Item | null>(null);
   let settingsOpen = $state(false);
+  /** The download being moved or renamed. */
+  let moveDialog = $state<Item | null>(null);
+  /** The download whose properties are shown; looked up live, so they stay current. */
+  let propertiesId = $state<number | null>(null);
+  let propertiesItem = $derived(propertiesId === null ? undefined : downloads.items[propertiesId]);
+  let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let toast = $state("");
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -98,6 +107,125 @@
   const openFile = (item: Item) => api.openFile(item.id).catch(showError);
   const showInFolder = (item: Item) => api.showInFolder(item.id).catch(showError);
   const moveTo = (queue: number) => each(selection, (id) => api.setQueue(id, queue));
+  const openWith = (item: Item) => api.openWith(item.id).catch(showError);
+  /** Only Windows has a system dialog to pick the program. */
+  const canOpenWith = navigator.userAgent.includes("Windows");
+
+  /** The menu for the selected downloads. */
+  function downloadMenu(): MenuItem[] {
+    const items = selection;
+    const one = items.length === 1 ? items[0] : null;
+    const finished = items.filter((i) => i.status === "completed");
+    const resumable = items.filter(canResume);
+    const pausable = items.filter(canPause);
+    const queues = new Set(items.map((i) => i.queue));
+    const menu: MenuItem[] = [];
+    if (one?.status === "completed") {
+      menu.push({ label: "Open", icon: "open", hint: "Enter", action: () => openFile(one) });
+      if (canOpenWith) menu.push({ label: "Open with…", action: () => openWith(one) });
+    }
+    if (one) menu.push({ label: "Show in folder", icon: "folder", action: () => showInFolder(one) });
+    if (menu.length > 0) menu.push("separator");
+    if (resumable.length > 0) {
+      menu.push({ label: "Resume", icon: "play", action: () => each(resumable, api.start) });
+    }
+    if (pausable.length > 0) {
+      menu.push({ label: "Pause", icon: "pause", action: () => each(pausable, api.pause) });
+    }
+    if (finished.length > 0) {
+      menu.push({
+        label: "Download again",
+        icon: "restart",
+        action: () => each(finished, api.restart),
+      });
+    }
+    if (one) {
+      const running = canPause(one);
+      menu.push({
+        label: running ? "Move / rename… (pause first)" : "Move / rename…",
+        disabled: running,
+        action: () => (moveDialog = one),
+      });
+    }
+    menu.push({
+      label: "Add to queue",
+      icon: "list",
+      items: downloads.queues.map((q) => ({
+        label: q.name,
+        checked: queues.size === 1 && queues.has(q.id),
+        action: () => moveTo(q.id),
+      })),
+    });
+    menu.push("separator", {
+      label: items.length > 1 ? `Remove ${items.length} downloads…` : "Remove…",
+      icon: "trash",
+      hint: "Del",
+      danger: true,
+      action: () => (removing = items),
+    });
+    if (one) {
+      menu.push("separator", {
+        label: "Properties",
+        icon: "sliders",
+        action: () => (propertiesId = one.id),
+      });
+    }
+    return menu;
+  }
+
+  function openMenu(x: number, y: number, items: MenuItem[]) {
+    menu = null;
+    // A new menu mounts fresh, so it measures and places itself again.
+    queueMicrotask(() => (menu = { x, y, items }));
+  }
+
+  function rowMenu(e: MouseEvent, item: Item) {
+    e.preventDefault();
+    if (!selected.has(item.id)) {
+      selected.clear();
+      selected.add(item.id);
+      anchor = item.id;
+    }
+    openMenu(e.clientX, e.clientY, downloadMenu());
+  }
+
+  function listMenu(e: MouseEvent) {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    selected.clear();
+    openMenu(e.clientX, e.clientY, [
+      { label: "Add download…", icon: "plus", hint: "Ctrl+N", action: () => (adding = true) },
+      {
+        label: "Select all",
+        hint: "Ctrl+A",
+        disabled: visible.length === 0,
+        action: () => visible.forEach((i) => selected.add(i.id)),
+      },
+    ]);
+  }
+
+  /**
+   * Replaces the browser's own menu, with its Reload and Inspect. Text fields keep it, for
+   * cut, copy and paste; selected text gets a Copy menu.
+   */
+  function windowMenu(e: MouseEvent) {
+    if (e.defaultPrevented) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("input:not([type=checkbox]), textarea")) return;
+    e.preventDefault();
+    const text = getSelection()?.toString() ?? "";
+    if (text) {
+      openMenu(e.clientX, e.clientY, [
+        {
+          label: "Copy",
+          hint: "Ctrl+C",
+          action: () => navigator.clipboard.writeText(text).catch(showError),
+        },
+      ]);
+    } else {
+      menu = null;
+    }
+  }
   const startQueue = (q: Queue) => api.startQueue(q.id).catch(showError);
   const stopQueue = (q: Queue) => api.stopQueue(q.id).catch(showError);
 
@@ -138,8 +266,34 @@
     else if (canResume(item)) api.start(item.id).catch(showError);
   }
 
+  /** Browser shortcuts that make no sense in an app, such as reloading the page. */
+  function isBrowserKey(e: KeyboardEvent) {
+    const ctrl = e.ctrlKey || e.metaKey;
+    const key = e.key.toLowerCase();
+    return e.key === "F5" || (ctrl && ["r", "p", "f", "g", "u", "j"].includes(key));
+  }
+
   function onkeydown(e: KeyboardEvent) {
-    if (adding || incoming.length > 0 || removing || queueDialog || limitDialog || urlDialog || settingsOpen) {
+    // Development builds keep them, to reload and inspect the UI.
+    if (import.meta.env.PROD && isBrowserKey(e)) {
+      e.preventDefault();
+      return;
+    }
+    if (menu) {
+      if (e.key === "Escape") menu = null;
+      return;
+    }
+    if (
+      adding ||
+      incoming.length > 0 ||
+      removing ||
+      queueDialog ||
+      limitDialog ||
+      urlDialog ||
+      settingsOpen ||
+      moveDialog ||
+      propertiesItem
+    ) {
       return;
     }
     const target = e.target as HTMLElement;
@@ -157,6 +311,10 @@
       activate(single);
     } else if (e.key === "Escape") {
       selected.clear();
+    } else if ((e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) && selection.length > 0) {
+      e.preventDefault();
+      const row = document.querySelector(".row.selected")?.getBoundingClientRect();
+      if (row) openMenu(row.left + 40, row.bottom, downloadMenu());
     }
   }
 
@@ -171,7 +329,7 @@
   }
 </script>
 
-<svelte:window {onkeydown} />
+<svelte:window {onkeydown} oncontextmenu={windowMenu} />
 
 <div class="shell">
   <aside class="sidebar">
@@ -285,7 +443,14 @@
       </div>
     {/if}
 
-    <div class="list" role="listbox" aria-multiselectable="true" aria-label="Downloads">
+    <div
+      class="list"
+      role="listbox"
+      tabindex="-1"
+      aria-multiselectable="true"
+      aria-label="Downloads"
+      oncontextmenu={listMenu}
+    >
       <div class="head" aria-hidden="true">
         <span>Name</span>
         <span>Size</span>
@@ -306,6 +471,7 @@
           aria-selected={selected.has(item.id)}
           onclick={(e) => select(e, item)}
           ondblclick={() => activate(item)}
+          oncontextmenu={(e) => rowMenu(e, item)}
         >
           <span class="name">
             <FileIcon {item} />
@@ -417,6 +583,21 @@
 {/if}
 {#if settingsOpen}
   <SettingsDialog onclose={() => (settingsOpen = false)} />
+{/if}
+{#if moveDialog}
+  <MoveDialog item={moveDialog} onclose={() => (moveDialog = null)} />
+{/if}
+{#if propertiesItem}
+  {@const item = propertiesItem}
+  <PropertiesDialog
+    {item}
+    onclose={() => (propertiesId = null)}
+    onlimit={() => (limitDialog = item)}
+    onaddress={() => (urlDialog = item)}
+  />
+{/if}
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
 {/if}
 {#if removing}
   <RemoveDialog items={removing} onclose={() => (removing = null)} />

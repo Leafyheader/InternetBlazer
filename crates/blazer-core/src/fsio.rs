@@ -102,6 +102,25 @@ pub(crate) fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// Moves `from` to `to`, also to another disk, never over an existing file.
+pub(crate) fn move_new(from: &Path, to: &Path) -> io::Result<()> {
+    match rename_new(from, to) {
+        Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+            let mut source = File::open(from)?;
+            let mut target = OpenOptions::new().write(true).create_new(true).open(to)?;
+            let copied = io::copy(&mut source, &mut target).and_then(|_| target.sync_all());
+            drop(target);
+            if let Err(e) = copied {
+                let _ = fs::remove_file(to);
+                return Err(e);
+            }
+            drop(source);
+            fs::remove_file(from)
+        }
+        result => result,
+    }
+}
+
 #[cfg(windows)]
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;

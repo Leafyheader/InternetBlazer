@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Context;
 use blazer_core::{
-    Config, DownloadId, DownloadRecord, Engine, Event, NewDownload, Progress, Status,
+    Config, DownloadId, DownloadRecord, Engine, Event, MediaFormat, NewDownload, Progress, Status,
 };
 use clap::{Parser, Subcommand};
 use tokio::sync::broadcast::error::RecvError;
@@ -38,6 +38,10 @@ enum Command {
         /// Speed limit for this download, such as 500K or 2M (bytes per second).
         #[arg(short = 'l', long, value_parser = parse_rate)]
         limit: Option<u64>,
+        /// Download the video on the page with yt-dlp: `best`, a height such as `720`, or
+        /// `audio` for the sound alone.
+        #[arg(short = 'm', long, value_parser = parse_media)]
+        media: Option<MediaFormat>,
     },
     /// Resume a paused or failed download.
     Resume { id: u64 },
@@ -52,6 +56,12 @@ enum Command {
     Limit {
         /// Bytes per second, such as 500K or 2M, or `off`.
         rate: Option<String>,
+    },
+    /// Show the programs video downloads use: yt-dlp and ffmpeg.
+    Tools {
+        /// Install the latest yt-dlp, or update the copy InternetBlazer installed.
+        #[arg(long)]
+        update: bool,
     },
     /// Remove a download from the list.
     Remove {
@@ -85,11 +95,17 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             .join("InternetBlazer")
             .join("state.redb"),
     };
-    let engine = Engine::open(&db, Config::default())
+    let tools_dir = db.parent().map(|dir| dir.join("tools"));
+    let engine = Engine::open(&db, Config { tools_dir, ..Config::default() })
         .with_context(|| format!("opening {}", db.display()))?;
 
     let code = match cli.command {
-        Command::Get { url, dir, output, connections, limit } => {
+        Command::Get { url, dir, output, connections, limit, media } => {
+            if media.is_some() && engine.media_tools().await.ytdlp.is_none() {
+                eprintln!("Installing yt-dlp, which video downloads need...");
+                let tool = engine.install_ytdlp().await?;
+                eprintln!("Installed yt-dlp {}", tool.version);
+            }
             let dir = match dir {
                 Some(dir) => dir,
                 None => dirs::download_dir().map_or_else(std::env::current_dir, Ok)?,
@@ -98,6 +114,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             new.file_name = output;
             new.connections = connections;
             new.speed_limit = limit;
+            new.media = media;
             let id = engine.add(new).await?;
             follow(&engine, id).await?
         }
@@ -129,6 +146,24 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             match engine.settings()?.speed_limit {
                 Some(limit) => println!("Speed limit: {}/s", bytes(limit)),
                 None => println!("No speed limit"),
+            }
+            ExitCode::SUCCESS
+        }
+        Command::Tools { update } => {
+            if update {
+                let tool = engine.install_ytdlp().await?;
+                println!("Installed yt-dlp {}", tool.version);
+            }
+            let tools = engine.media_tools().await;
+            match tools.ytdlp {
+                Some(t) => println!("yt-dlp {} at {}", t.version, t.path.display()),
+                None => println!("yt-dlp: not installed; install it with: blazer tools --update"),
+            }
+            match tools.ffmpeg {
+                Some(path) => println!("ffmpeg at {}", path.display()),
+                None => println!(
+                    "ffmpeg: not found; without it, many sites only offer low qualities or none"
+                ),
             }
             ExitCode::SUCCESS
         }
@@ -270,6 +305,19 @@ fn parse_rate(s: &str) -> Result<u64, String> {
         return Err("the rate must be above zero".into());
     }
     Ok((number * multiplier) as u64)
+}
+
+fn parse_media(s: &str) -> Result<MediaFormat, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "best" => Ok(MediaFormat::Video { max_height: None }),
+        "audio" => Ok(MediaFormat::Audio),
+        height => {
+            let height = height.trim_end_matches('p').parse().map_err(|_| {
+                format!("`{s}` is not a quality; use best, audio or a height such as 720")
+            })?;
+            Ok(MediaFormat::Video { max_height: Some(height) })
+        }
+    }
 }
 
 fn bytes(n: u64) -> String {

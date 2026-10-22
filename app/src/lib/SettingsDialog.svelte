@@ -1,7 +1,7 @@
 <script lang="ts">
   import { open as pickFolder } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { api, type Prefs, type Settings } from "./api";
+  import { api, type MediaTools, type Prefs, type Settings } from "./api";
   import Icon from "./Icon.svelte";
 
   let { onclose }: { onclose: () => void } = $props();
@@ -16,6 +16,10 @@
   let busy = $state(false);
   let error = $state("");
   let dialog: HTMLDialogElement;
+  /** Null while yt-dlp is asked for its version, which takes a moment. */
+  let tools = $state<MediaTools | null>(null);
+  let updating = $state(false);
+  let toolsMessage = $state("");
 
   onMount(() => {
     dialog.showModal();
@@ -27,7 +31,24 @@
         return api.systemDownloadDir().then((d) => (systemDir = d ?? ""));
       })
       .catch((err) => (error = String(err)));
+    api.mediaTools().then((t) => (tools = t));
   });
+
+  async function updateYtdlp() {
+    updating = true;
+    toolsMessage = "";
+    try {
+      const before = tools?.ytdlp?.managed ? tools.ytdlp.version : null;
+      const installed = await api.installYtdlp();
+      toolsMessage =
+        before === installed.version ? "Already the latest version." : `Installed yt-dlp ${installed.version}.`;
+      tools = await api.mediaTools();
+    } catch (err) {
+      toolsMessage = String(err);
+    } finally {
+      updating = false;
+    }
+  }
 
   async function browse() {
     if (!prefs) return;
@@ -100,6 +121,45 @@
           A download that loses its connection is tried again this many times, waiting longer each time,
           before it counts as failed. 0 turns this off.
         </p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Video downloads</legend>
+        {#if tools === null}
+          <p class="hint muted">Checking yt-dlp…</p>
+        {:else}
+          <div class="inline">
+            <span class="grow">
+              {#if tools.ytdlp}
+                yt-dlp {tools.ytdlp.version}
+                {#if !tools.ytdlp.managed}
+                  <span class="muted path" title={tools.ytdlp.path}>· from your system</span>
+                {/if}
+              {:else}
+                yt-dlp is fetched the first time you download a video.
+              {/if}
+            </span>
+            <button type="button" onclick={updateYtdlp} disabled={updating}>
+              {updating ? "Getting yt-dlp…" : tools.ytdlp?.managed ? "Update yt-dlp" : "Install yt-dlp"}
+            </button>
+          </div>
+          <p class="hint muted" aria-live="polite">
+            {toolsMessage ||
+              (tools.ytdlp && !tools.ytdlp.managed
+                ? "Found on your system. Installing gives InternetBlazer its own copy, which it keeps up to date."
+                : "Sites change often; when videos stop downloading, updating yt-dlp usually fixes it.")}
+          </p>
+          {#if tools.ffmpeg}
+            <p class="hint muted">
+              <span class="path" title={tools.ffmpeg}>ffmpeg is installed</span>, so every quality is offered.
+            </p>
+          {:else}
+            <p class="hint warn">
+              ffmpeg isn't installed. Without it, YouTube and many other sites offer only the sound or
+              low qualities. On Windows, install it with: winget install ffmpeg
+            </p>
+          {/if}
+        {/if}
       </fieldset>
 
       <fieldset>

@@ -423,6 +423,55 @@ async fn picks_a_unique_name_and_removes_files() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn moves_and_renames_a_finished_file_without_replacing_others() {
+    let (server, url) = Server::new(10_000).spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    engine.wait(id).await.unwrap();
+
+    let elsewhere = tmp.path().join("sub");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("taken.bin"), b"keep").unwrap();
+    let error = engine.move_to(id, elsewhere.clone(), "taken.bin").await.unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error}");
+    assert_eq!(std::fs::read(elsewhere.join("taken.bin")).unwrap(), b"keep");
+
+    engine.move_to(id, elsewhere.clone(), "renamed.bin").await.unwrap();
+    let record = engine.get(id).unwrap();
+    assert_eq!(record.path(), elsewhere.join("renamed.bin"));
+    assert_eq!(std::fs::read(record.path()).unwrap(), server.data);
+    assert!(!tmp.path().join("file.bin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_moved_paused_download_resumes_in_its_new_place() {
+    let size = 2 * 1024 * 1024;
+    let mut server = Server::new(size);
+    server.chunk_delay = Duration::from_millis(10);
+    let (server, url) = server.spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+
+    let error = engine.move_to(id, tmp.path().into(), "x.bin").await.unwrap_err();
+    assert!(error.to_string().contains("pause"), "a running download cannot move: {error}");
+    pause_after(&engine, id, size as u64 / 4).await;
+    let paused = engine.wait(id).await.unwrap();
+
+    let dest = tmp.path().join("moved");
+    engine.move_to(id, dest.clone(), "x.bin").await.unwrap();
+    assert!(dest.join("x.bin.part").exists());
+    assert!(!paused.part_path().exists());
+    engine.start(id).unwrap();
+    let record = engine.wait(id).await.unwrap();
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_eq!(std::fs::read(dest.join("x.bin")).unwrap(), server.data);
+    let sent = server.bytes_sent.load(Ordering::Relaxed);
+    assert!(sent < size as u64 * 5 / 4, "the progress moved along ({sent} bytes sent)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sheds_connections_when_the_server_throttles() {
     let mut server = Server::new(2 * 1024 * 1024);
     server.max_concurrent = 2;

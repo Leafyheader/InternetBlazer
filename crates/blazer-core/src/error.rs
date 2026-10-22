@@ -57,6 +57,11 @@ pub enum Error {
     QueueNotFound(QueueId),
     #[error("{0}")]
     Invalid(String),
+    /// yt-dlp failed, with its own explanation.
+    #[error("{message}")]
+    Media { message: String, retryable: bool },
+    #[error("video downloads need yt-dlp, which is not installed")]
+    NoYtdlp,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -68,6 +73,7 @@ impl Error {
             Error::Network(e) => !(e.is_builder() || e.is_redirect()),
             Error::Status(code) => *code >= 500 || *code == 408,
             Error::Throttled { .. } | Error::Truncated | Error::Incomplete => true,
+            Error::Media { retryable, .. } => *retryable,
             _ => false,
         }
     }
@@ -112,7 +118,7 @@ fn status_message(code: u16) -> String {
     let meaning = match code {
         401 => "the server wants you to sign in",
         403 => {
-            "access denied: the link may have expired, or the site needs you to be signed in.              Start the download again from the browser, or give it a new address"
+            "access denied: the link may have expired, or the site needs you to be signed in. \n             Start the download again from the browser, or give it a new address"
         }
         404 => "the file was not found on the server",
         407 => "the proxy wants you to sign in",

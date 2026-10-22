@@ -34,6 +34,8 @@ export interface DownloadRecord {
   queue: number;
   /** Bytes per second. */
   speedLimit: number | null;
+  /** Set for a video on a web page, which yt-dlp downloads. */
+  media: MediaFormat | null;
   segments: Segment[];
   status: Status;
   error: string | null;
@@ -64,6 +66,46 @@ export interface LinkInfo {
   fileName: string | null;
   total: number | null;
   resumable: boolean;
+  /** A web page rather than a file, which may have a video on it. */
+  page: boolean;
+}
+
+/** What a media download fetches: the best video up to a height, or only the sound. */
+export type MediaFormat = { type: "video"; maxHeight: number | null } | { type: "audio" };
+
+/** The videos yt-dlp found on a page. */
+export interface MediaInfo {
+  title: string;
+  site: string;
+  /** Seconds. */
+  duration: number | null;
+  /** Best first, then the audio-only choice if there is one. */
+  choices: MediaChoice[];
+  /** Without ffmpeg, sites that keep picture and sound apart offer few qualities or none. */
+  ffmpeg: boolean;
+}
+
+export interface MediaChoice {
+  /** Such as "1080p60" or "Audio only". */
+  label: string;
+  format: MediaFormat;
+  /** Likely extension, without the dot. */
+  ext: string;
+  /** An estimate. */
+  size: number | null;
+}
+
+export interface Tool {
+  path: string;
+  version: string;
+  /** Installed by the app, which can update it; otherwise found on PATH. */
+  managed: boolean;
+}
+
+/** The programs video downloads use. */
+export interface MediaTools {
+  ytdlp: Tool | null;
+  ffmpeg: string | null;
 }
 
 export interface Schedule {
@@ -125,6 +167,8 @@ export interface AddRequest {
   start: boolean;
   /** Passed on from the browser, such as its cookies. */
   headers?: [string, string][];
+  /** Download the video on the page with yt-dlp. */
+  media?: MediaFormat | null;
 }
 
 /** A download handed over by the browser extension, waiting for the user to confirm it. */
@@ -143,6 +187,11 @@ export const api = {
   systemDownloadDir: () => invoke<string | null>("system_download_dir"),
   inspect: (url: string, headers: [string, string][]) =>
     invoke<LinkInfo>("inspect_link", { url, headers }),
+  inspectMedia: (url: string, headers: [string, string][]) =>
+    invoke<MediaInfo>("inspect_media", { url, headers }),
+  mediaTools: () => invoke<MediaTools>("media_tools"),
+  /** Installs or updates yt-dlp. */
+  installYtdlp: () => invoke<Tool>("install_ytdlp"),
   freeSpace: (dir: string) => invoke<number | null>("free_space", { dir }),
   add: (request: AddRequest) => invoke<number>("add_download", { request }),
   start: (id: number) => invoke<void>("start_download", { id }),
@@ -170,6 +219,11 @@ export const api = {
   openLogFolder: () => invoke<void>("open_log_folder"),
   takeBrowserDownloads: () => invoke<Incoming[]>("take_browser_downloads"),
   openFile: (id: number) => invoke<void>("open_file", { id }),
+  /** The system's "Open with" dialog; Windows only. */
+  openWith: (id: number) => invoke<void>("open_with", { id }),
+  /** Moves or renames the file, or a paused download's partial data. */
+  move: (id: number, dir: string, fileName: string) =>
+    invoke<void>("move_download", { id, dir, fileName }),
   showInFolder: (id: number) => invoke<void>("show_in_folder", { id }),
   /** PNG bytes. */
   fileIcon: (id: number, size: number) => invoke<ArrayBuffer>("file_icon", { id, size }),

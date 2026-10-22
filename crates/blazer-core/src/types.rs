@@ -73,6 +73,11 @@ pub struct DownloadRecord {
     /// Bytes per second, applied on top of the global limit.
     #[serde(default)]
     pub speed_limit: Option<u64>,
+    /// Set for a video or audio on a web page, which yt-dlp downloads instead of the engine.
+    /// `file_name` is then a guess until it finishes, since yt-dlp picks the final extension.
+    #[serde(default)]
+    pub media: Option<MediaFormat>,
+    /// For a media download, a single segment that counts its bytes.
     pub segments: Vec<Segment>,
     pub status: Status,
     pub error: Option<String>,
@@ -142,6 +147,66 @@ pub struct LinkInfo {
     pub file_name: Option<String>,
     pub total: Option<u64>,
     pub resumable: bool,
+    /// The link leads to a web page rather than a file, such as a page with a video on it.
+    pub page: bool,
+}
+
+/// What a media download fetches: the best video up to a height, or only the sound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum MediaFormat {
+    #[serde(rename_all = "camelCase")]
+    Video {
+        /// In pixels; `None` takes the best there is.
+        max_height: Option<u32>,
+    },
+    Audio,
+}
+
+/// The videos or sounds yt-dlp found on a page.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaInfo {
+    pub title: String,
+    /// Such as `Youtube`.
+    pub site: String,
+    /// In seconds.
+    pub duration: Option<f64>,
+    /// Best first, then the audio-only choice if there is one.
+    pub choices: Vec<MediaChoice>,
+    /// Whether ffmpeg was found. Without it, sites that keep video and sound apart (as YouTube
+    /// does) offer only the qualities that come in one file, which may be none.
+    pub ffmpeg: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaChoice {
+    /// Such as `1080p60` or `Audio only`.
+    pub label: String,
+    pub format: MediaFormat,
+    /// The likely extension of the file, without the dot.
+    pub ext: String,
+    /// An estimate; sites don't always say.
+    pub size: Option<u64>,
+}
+
+/// The programs media downloads use.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTools {
+    /// `None` until it is installed.
+    pub ytdlp: Option<Tool>,
+    pub ffmpeg: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tool {
+    pub path: PathBuf,
+    pub version: String,
+    /// The engine installed this copy and can update it; otherwise it was found on `PATH`.
+    pub managed: bool,
 }
 
 /// Engine-wide settings that persist in the [`Store`](crate::Store).
