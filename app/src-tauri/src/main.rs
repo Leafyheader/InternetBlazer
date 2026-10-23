@@ -9,6 +9,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bridge;
+mod categories;
+mod finish;
 mod icons;
 mod prefs;
 mod tray;
@@ -21,6 +23,8 @@ use blazer_core::{
     MediaTools, NewDownload, Queue, QueueId, Settings, Status, Tool,
 };
 use bridge::{Bridge, Incoming};
+use categories::{Category, CategoryInfo};
+use finish::{Finish, FinishAction};
 use prefs::{Prefs, PrefsStore};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, ipc::Response};
@@ -68,10 +72,16 @@ async fn get_download(engine: State<'_, Engine>, id: DownloadId) -> CmdResult<Do
     engine.get(id).map_err(message)
 }
 
-/// The folder the add dialog starts in.
+/// The folder the add dialog suggests for a file, going by its name.
 #[tauri::command]
-fn default_dir(prefs: State<'_, PrefsStore>) -> Option<PathBuf> {
-    prefs.get().target_dir()
+fn default_dir(prefs: State<'_, PrefsStore>, file_name: &str, media: bool) -> Option<PathBuf> {
+    prefs.get().target_dir(Category::of(file_name, media))
+}
+
+/// The file types downloads are sorted by, so the UI sorts them the same way.
+#[tauri::command]
+fn file_categories() -> Vec<CategoryInfo> {
+    categories::all()
 }
 
 /// Where downloads go when the user hasn't picked a folder.
@@ -225,6 +235,33 @@ async fn stop_queue(engine: State<'_, Engine>, id: QueueId) -> CmdResult<()> {
 }
 
 /// The engine's settings, with those left unset filled in from its configuration.
+/// What each queue does when it finishes, for the queues that do something.
+#[tauri::command]
+fn finish_actions(finish: State<'_, Finish>) -> std::collections::HashMap<QueueId, FinishAction> {
+    finish.actions()
+}
+
+/// Sets what the queue does when it next finishes, or clears it with `None`.
+#[tauri::command]
+fn set_finish_action(
+    app: AppHandle,
+    finish: State<'_, Finish>,
+    queue: QueueId,
+    action: Option<FinishAction>,
+) {
+    finish.set(&app, queue, action);
+}
+
+#[tauri::command]
+fn cancel_finish(app: AppHandle, finish: State<'_, Finish>) {
+    finish.cancel(&app);
+}
+
+#[tauri::command]
+fn finish_now(app: AppHandle, finish: State<'_, Finish>) {
+    finish.now(&app);
+}
+
 #[tauri::command]
 async fn get_settings(engine: State<'_, Engine>) -> CmdResult<Settings> {
     let settings = engine.settings().map_err(message)?;
@@ -490,6 +527,7 @@ fn forward_events(app: AppHandle, engine: &Engine) {
             match events.recv().await {
                 Ok(event) => {
                     activity.observe(&app, &event);
+                    app.state::<Finish>().observe(&app, &engine, &event);
                     if let Event::StatusChanged { id, status, error } = &event {
                         notify_status(&app, &engine, *id, *status, error.as_deref());
                     }
@@ -547,6 +585,7 @@ fn main() {
         .setup(|app| {
             let db = db_path()?;
             app.manage(PrefsStore::open(data_dir()?.join("app.json")));
+            app.manage(Finish::default());
             let config = Config { tools_dir: Some(tools_dir()?), ..Config::default() };
             let engine =
                 Engine::open(&db, config).with_context(|| format!("opening {}", db.display()))?;
@@ -588,6 +627,7 @@ fn main() {
             list_downloads,
             get_download,
             default_dir,
+            file_categories,
             system_download_dir,
             inspect_link,
             inspect_media,
@@ -609,6 +649,10 @@ fn main() {
             remove_queue,
             start_queue,
             stop_queue,
+            finish_actions,
+            set_finish_action,
+            cancel_finish,
+            finish_now,
             get_settings,
             set_settings,
             set_speed_limit,

@@ -2,12 +2,15 @@
 //! JSON next to the engine's store.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+
+use crate::categories::Category;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -17,6 +20,12 @@ pub struct Prefs {
     /// New downloads go to the folder used last instead of `download_dir`.
     pub remember_last_dir: bool,
     pub last_dir: Option<PathBuf>,
+    /// New downloads go to a folder for their file type, such as Downloads\Video. This wins over
+    /// `remember_last_dir`.
+    pub sort_by_type: bool,
+    /// Folders the user picked for some file types. The others use a subfolder of the download
+    /// folder named after the type.
+    pub category_dirs: BTreeMap<Category, PathBuf>,
     /// Browser downloads wait in the add dialog. Otherwise they start right away.
     pub confirm_browser_downloads: bool,
     /// Closing the window hides it, and the app keeps running in the tray.
@@ -35,6 +44,8 @@ impl Default for Prefs {
             download_dir: None,
             remember_last_dir: true,
             last_dir: None,
+            sort_by_type: true,
+            category_dirs: BTreeMap::new(),
             confirm_browser_downloads: true,
             close_to_tray: true,
             notify: true,
@@ -45,10 +56,25 @@ impl Default for Prefs {
 }
 
 impl Prefs {
-    /// The folder new downloads go to unless the user picks another.
-    pub fn target_dir(&self) -> Option<PathBuf> {
+    /// The folder a new download of this type goes to unless the user picks another.
+    pub fn target_dir(&self, category: Category) -> Option<PathBuf> {
+        if self.sort_by_type {
+            return self.category_dir(category);
+        }
         let last = self.last_dir.as_ref().filter(|_| self.remember_last_dir);
-        last.or(self.download_dir.as_ref()).cloned().or_else(dirs::download_dir)
+        last.cloned().or_else(|| self.base_dir())
+    }
+
+    /// Where files of this type go when downloads are sorted by type.
+    pub fn category_dir(&self, category: Category) -> Option<PathBuf> {
+        match self.category_dirs.get(&category) {
+            Some(dir) => Some(dir.clone()),
+            None => self.base_dir().map(|dir| dir.join(category.folder())),
+        }
+    }
+
+    fn base_dir(&self) -> Option<PathBuf> {
+        self.download_dir.clone().or_else(dirs::download_dir)
     }
 }
 
@@ -102,11 +128,27 @@ mod tests {
         let mut prefs = Prefs {
             download_dir: Some("D:/Downloads".into()),
             last_dir: Some("E:/Films".into()),
+            sort_by_type: false,
             ..Prefs::default()
         };
-        assert_eq!(prefs.target_dir(), Some("E:/Films".into()));
+        assert_eq!(prefs.target_dir(Category::Video), Some("E:/Films".into()));
         prefs.remember_last_dir = false;
-        assert_eq!(prefs.target_dir(), Some("D:/Downloads".into()));
+        assert_eq!(prefs.target_dir(Category::Video), Some("D:/Downloads".into()));
+    }
+
+    #[test]
+    fn sorts_into_type_folders_unless_one_was_picked() {
+        let mut prefs = Prefs {
+            download_dir: Some("D:/Downloads".into()),
+            last_dir: Some("E:/Films".into()),
+            ..Prefs::default()
+        };
+        assert_eq!(
+            prefs.target_dir(Category::Music),
+            Some(Path::new("D:/Downloads").join("Music"))
+        );
+        prefs.category_dirs.insert(Category::Video, "E:/Films".into());
+        assert_eq!(prefs.target_dir(Category::Video), Some("E:/Films".into()));
     }
 
     #[test]

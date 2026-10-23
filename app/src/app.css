@@ -151,17 +151,22 @@ button.link:hover:not(:disabled) {
 
 .shell {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: auto 1fr;
+  /* One row exactly the window's height, so tall details can't push the sidebar's bottom out of view. */
+  grid-template-rows: minmax(0, 1fr);
   height: 100%;
 }
 
 .sidebar {
+  width: 220px;
+  box-sizing: border-box;
   background: var(--sidebar);
   border-right: 1px solid var(--border);
   padding: 16px 12px;
   display: flex;
   flex-direction: column;
   gap: 16px;
+  overflow-y: auto;
 }
 .brand {
   display: flex;
@@ -174,6 +179,51 @@ button.link:hover:not(:disabled) {
 .logo {
   width: 26px;
   height: 26px;
+}
+.brand .fold-sidebar {
+  margin-left: auto;
+  color: var(--muted);
+}
+/* Narrowed to icons: names and counts move into tooltips, and sections can't be folded. */
+.sidebar.narrow {
+  width: 60px;
+  padding: 16px 8px;
+  align-items: stretch;
+}
+.sidebar.narrow .label,
+.sidebar.narrow .count,
+.sidebar.narrow .logo,
+.sidebar.narrow .section,
+.sidebar.narrow .queue-name > .dot {
+  display: none;
+}
+.sidebar.narrow .brand {
+  justify-content: center;
+  padding: 0;
+}
+.sidebar.narrow .brand .fold-sidebar {
+  margin-left: 0;
+}
+.sidebar.narrow nav + nav:not(.settings) {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.sidebar.narrow .filter {
+  justify-content: center;
+  padding: 8px 0;
+}
+.queue-icon {
+  display: none;
+  position: relative;
+}
+.sidebar.narrow .queue-icon {
+  display: inline-flex;
+}
+.queue-icon .dot {
+  position: absolute;
+  right: -3px;
+  bottom: -2px;
+  outline: 2px solid var(--sidebar);
 }
 .sidebar .settings {
   margin-top: auto;
@@ -201,10 +251,27 @@ nav {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0 0 4px 10px;
+  padding: 0 0 4px 4px;
   font-size: 12px;
   font-weight: 600;
   color: var(--muted);
+}
+.section .fold {
+  border: none;
+  background: transparent;
+  padding: 2px 6px 2px 0;
+  gap: 4px;
+  font: inherit;
+  color: inherit;
+}
+.section .fold:hover {
+  color: var(--text);
+}
+.section .fold svg {
+  transition: transform 0.15s;
+}
+.section .fold[aria-expanded="true"] svg {
+  transform: rotate(90deg);
 }
 .queue-name {
   display: flex;
@@ -242,6 +309,7 @@ main {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   background: var(--surface);
 }
 
@@ -255,6 +323,10 @@ main {
 .toolbar button {
   border-color: transparent;
   background: transparent;
+}
+.toolbar button.on {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
 }
 .toolbar select.move {
   width: auto;
@@ -273,6 +345,18 @@ main {
 .queuebar button {
   padding: 4px 10px;
 }
+.queuebar .when-done {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.queuebar .when-done select {
+  width: auto;
+  padding: 4px 8px;
+  color: var(--text);
+  background: var(--surface);
+}
 .spacer {
   flex: 1;
 }
@@ -286,16 +370,54 @@ main {
 
 .list {
   flex: 1;
-  overflow-y: auto;
-  --columns: minmax(180px, 1fr) 80px minmax(140px, 220px) 90px 80px;
+  overflow: auto;
 }
+/* Columns have the widths the user dragged them to; the list scrolls sideways when they don't fit. */
 .head,
 .row {
   display: grid;
   grid-template-columns: var(--columns);
   gap: 16px;
   align-items: center;
+  width: max-content;
+  min-width: 100%;
   padding: 0 16px;
+}
+.head .col {
+  position: relative;
+  min-width: 0;
+  overflow: visible;
+  white-space: nowrap;
+}
+/* Sits in the gap after the column, so the whole gap can be grabbed. */
+.grip {
+  position: absolute;
+  top: -8px;
+  bottom: -8px;
+  right: -12px;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.grip::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 3.5px;
+  width: 1px;
+  background: var(--border);
+}
+.grip:hover::after {
+  background: var(--accent);
+}
+.row > * {
+  min-width: 0;
+}
+.nowrap {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .head {
   position: sticky;
@@ -443,6 +565,33 @@ main {
   gap: 10px;
   background: var(--bg);
 }
+/* Holds the details under the list; a long address scrolls here instead of squeezing the list away. */
+.panel {
+  flex-shrink: 0;
+  max-height: 45%;
+  overflow-y: auto;
+  background: var(--bg);
+}
+.panel.sized {
+  max-height: calc(100% - 160px);
+}
+.panel > .details {
+  min-height: 100%;
+  box-sizing: border-box;
+}
+/* Lies over the panel's top border, so the border itself can be grabbed. */
+.panel-grip {
+  position: relative;
+  z-index: 2;
+  flex-shrink: 0;
+  height: 7px;
+  margin-bottom: -7px;
+  cursor: row-resize;
+  touch-action: none;
+}
+.panel-grip:hover {
+  border-top: 2px solid var(--accent);
+}
 .segments {
   position: relative;
   height: 14px;
@@ -570,6 +719,18 @@ dialog .inline {
 }
 .grow {
   flex: 1;
+}
+dialog .type-folder {
+  align-items: center;
+}
+.type-folder .type-name {
+  flex: none;
+  width: 88px;
+  font-size: 13.5px;
+}
+.type-folder input {
+  flex: 1;
+  min-width: 0;
 }
 input.narrow {
   width: 96px;

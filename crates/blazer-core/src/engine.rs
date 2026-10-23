@@ -605,6 +605,7 @@ impl Engine {
             interrupted: false,
             added_at: types::now(),
             completed_at: None,
+            last_try_at: None,
         };
         self.inner.store.save(&record)?;
         self.inner.emit(Event::Added(record));

@@ -2,6 +2,8 @@
 
 import {
   api,
+  type Category,
+  type CategoryInfo,
   onEngineEvent,
   onResync,
   type DownloadRecord,
@@ -35,11 +37,12 @@ export const FILTERS: { id: Filter; label: string; matches: (s: Status) => boole
   { id: "failed", label: "Failed", matches: (s) => s === "failed" },
 ];
 
-/** What the list shows: downloads with some status, or the downloads of one queue. */
-export type View = { filter: Filter } | { queue: number };
+/** What the list shows: downloads with some status, of one file type, or of one queue. */
+export type View = { filter: Filter } | { queue: number } | { category: Category };
 
 export function inView(view: View, item: Item): boolean {
   if ("queue" in view) return item.queue === view.queue;
+  if ("category" in view) return downloads.categoryOf(item) === view.category;
   return FILTERS.find((f) => f.id === view.filter)!.matches(item.status);
 }
 
@@ -64,6 +67,8 @@ class Downloads {
   queues = $state<Queue[]>([]);
   /** The global limit in bytes per second. */
   speedLimit = $state<number | null>(null);
+  /** File types, as the app sorts downloads into folders. */
+  categories = $state<CategoryInfo[]>([]);
 
   /** Newest first. */
   sorted = $derived(Object.values(this.items).sort((a, b) => b.id - a.id));
@@ -71,14 +76,24 @@ class Downloads {
   totalSpeed = $derived(this.sorted.reduce((sum, item) => sum + item.speed, 0));
 
   async load() {
-    const [records, queues, settings] = await Promise.all([
+    const [records, queues, settings, categories] = await Promise.all([
       api.list(),
       api.queues(),
       api.settings(),
+      api.fileCategories(),
     ]);
     this.items = Object.fromEntries(records.map((r) => [r.id, toItem(r, this.items[r.id])]));
     this.queues = queues;
     this.speedLimit = settings.speedLimit;
+    this.categories = categories;
+  }
+
+  /** The file type of a download, going by its name, as the app picks its folder. */
+  categoryOf(item: { fileName: string; media: unknown }): Category {
+    if (item.media) return "video";
+    const dot = item.fileName.lastIndexOf(".");
+    const ext = dot < 0 ? "" : item.fileName.slice(dot + 1).toLowerCase();
+    return this.categories.find((c) => c.extensions.includes(ext))?.id ?? "other";
   }
 
   async loadQueues() {

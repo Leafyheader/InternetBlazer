@@ -20,6 +20,7 @@ A fast, open-source, cross-platform download manager written in Rust: an IDM alt
 - **File type detection.** A file sent without an extension gets one from its first bytes ("magic bytes"), such as `.mp4`, `.flv`, `.zip` or `.pdf`, so it opens with the right program.
 - **Queues.** Started downloads wait in a queue that runs a set number at a time, oldest first. You can add your own queues and move downloads between them.
 - **Scheduler.** A queue can start and stop at set times on chosen weekdays (local time), for example overnight. A stop time at or before the start time means the next day. Schedules run only while the desktop app is open.
+- **Folders by file type.** Each download goes to the folder for its type, such as `Downloads\Video` or `Downloads\Compressed`, picked from the file's name. The download dialog shows the folder, which you can still change, and the sidebar lists downloads by type.
 - **Speed limits.** One limit for all downloads together, plus an optional limit per download. Both can be changed while downloads run.
 - **Videos from web pages.** For a link to a page with a video, such as on YouTube, [yt-dlp](https://github.com/yt-dlp/yt-dlp) finds the video and the qualities it comes in, and downloads it. These downloads queue, pause, resume and retry like any other. yt-dlp is installed on first use from its official release, after checking the release's published SHA-256, and can be updated from Settings; a copy on `PATH` also works. On Windows it is yt-dlp's folder build, which starts in under a second instead of three. For YouTube, yt-dlp also needs [deno](https://deno.com) to get every quality, which Settings can install the same way. An HLS (`.m3u8`) or DASH (`.mpd`) playlist link is read directly, which lists its qualities in a moment. Sites like YouTube keep picture and sound apart, and joining them needs [ffmpeg](https://ffmpeg.org) on `PATH` (on Windows: `winget install ffmpeg`). Without it, only the sound or qualities that come in one file are offered.
 
@@ -65,9 +66,9 @@ Closing the window keeps the app running in the tray, so downloads carry on. Cli
 
 Settings, at the bottom of the sidebar:
 
-- **Downloads:** the default folder, or whether to start in the folder used last; connections per download; how many automatic retries a download gets. The connections and retries settings are shared with the CLI.
+- **Downloads:** the default folder; whether new downloads are sorted into a folder per file type (on by default: `Video`, `Music`, `Compressed`, `Documents`, `Programs` and `Other` inside the default folder, each of which can be moved anywhere), or else whether to start in the folder used last; connections per download; how many automatic retries a download gets. The connections and retries settings are shared with the CLI.
 - **Video downloads:** the yt-dlp version, with a button to update it; deno, which yt-dlp needs for every YouTube quality, with a button to install it; and whether ffmpeg was found.
-- **Browser:** whether files from the extension wait in the download dialog or start right away in the default folder.
+- **Browser:** whether files from the extension wait in the download dialog or start right away in the folder for their type.
 - **Desktop:** starting at sign-in (hidden in the tray), keeping the app in the tray when the window is closed, and notifications when downloads finish or fail while the window is in the background.
 - **Updates:** whether to check for a newer version each time the app starts. A newer version found at start shows a notice with an install button, and a dot next to About.
 

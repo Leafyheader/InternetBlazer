@@ -25,6 +25,8 @@
   // svelte-ignore state_referenced_locally
   let url = $state(prefill?.url ?? "");
   let dir = $state("");
+  /** Set once the user picks a folder, which then no longer follows the file's type. */
+  let touchedDir = false;
   // A video's name follows the quality picked here, which may change its extension.
   // svelte-ignore state_referenced_locally
   let fileName = $state((prefill?.media ? null : prefill?.fileName) ?? "");
@@ -58,6 +60,10 @@
   );
   let videoName = $derived(media && chosen ? `${videoStem}.${chosen.ext}` : null);
   let size = $derived(media ? (chosen?.size ?? null) : (info?.total ?? null));
+  /** The best guess so far at the file's name, which decides its folder. */
+  let likelyName = $derived(
+    fileName.trim() || videoName || info?.fileName || prefill?.fileName || nameInUrl(url) || "",
+  );
   /** Bytes free where the file goes, or null when unknown. */
   let free = $state<number | null>(null);
   let tooBig = $derived(size !== null && free !== null && size > free);
@@ -135,6 +141,19 @@
     };
   });
 
+  // The folder for the file's type, which may change as more is known about the file.
+  $effect(() => {
+    const name = likelyName;
+    const video = media !== null || !!prefill?.media;
+    let stale = false;
+    api.defaultDir(name, video).then((d) => {
+      if (!stale && !touchedDir) dir = d ?? "";
+    });
+    return () => {
+      stale = true;
+    };
+  });
+
   $effect(() => {
     const target = dir.trim();
     free = null;
@@ -152,8 +171,6 @@
 
   onMount(() => {
     dialog.showModal();
-    // Only fills in what the user hasn't typed yet.
-    api.defaultDir().then((d) => (dir ||= d ?? ""));
     api.settings().then((s) => {
       if (!touchedConnections && s.connections !== null) connections = s.connections;
     });
@@ -161,7 +178,20 @@
 
   async function browse() {
     const picked = await pickFolder({ directory: true, defaultPath: dir || undefined });
-    if (typeof picked === "string") dir = picked;
+    if (typeof picked === "string") {
+      dir = picked;
+      touchedDir = true;
+    }
+  }
+
+  /** The last part of a link's path, which is often the file's name. */
+  function nameInUrl(link: string): string {
+    try {
+      const { pathname } = new URL(link.trim());
+      return decodeURIComponent(pathname.slice(pathname.lastIndexOf("/") + 1));
+    } catch {
+      return "";
+    }
   }
 
   async function submit(e: SubmitEvent) {
@@ -255,7 +285,7 @@
     <label>
       <span>Save to</span>
       <div class="inline">
-        <input bind:value={dir} required spellcheck="false" />
+        <input bind:value={dir} oninput={() => (touchedDir = true)} required spellcheck="false" />
         <button type="button" onclick={browse}><Icon name="folder" />Browse</button>
       </div>
       {#if free !== null}

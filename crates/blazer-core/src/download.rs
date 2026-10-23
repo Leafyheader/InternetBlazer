@@ -170,6 +170,7 @@ async fn execute(
     let cfg = &inner.config;
     record.status = Status::Downloading;
     record.error = None;
+    record.last_try_at = Some(types::now());
     inner.save_running(record)?;
     inner.emit(Event::StatusChanged { id: record.id, status: record.status, error: None });
 

@@ -92,6 +92,10 @@ pub struct DownloadRecord {
     /// Unix timestamp in seconds.
     pub added_at: u64,
     pub completed_at: Option<u64>,
+    /// When it last started downloading. `None` for downloads never started, and for those
+    /// added before this was kept.
+    #[serde(default)]
+    pub last_try_at: Option<u64>,
 }
 
 impl DownloadRecord {

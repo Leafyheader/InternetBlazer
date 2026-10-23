@@ -2,7 +2,7 @@
 //!
 //! A browser download normally waits in [`Bridge`] until the UI takes it and shows it in the add
 //! dialog, so the user picks where it goes; `browser-download` tells the UI that one is waiting.
-//! Users can turn that off, and then it starts right away in the usual folder.
+//! Users can turn that off, and then it starts right away in the folder for its file type.
 //!
 //! The extension's button on videos first asks what yt-dlp finds on the page, then sends the
 //! page with the quality the user picked.
@@ -16,7 +16,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::prefs::PrefsStore;
+use crate::{
+    categories::{self, Category},
+    prefs::PrefsStore,
+};
 
 /// A download from the browser, as the add dialog fills it in.
 #[derive(Debug, Clone, Serialize)]
@@ -68,12 +71,11 @@ async fn handle(app: &AppHandle, request: Request) -> Response {
             let headers = download.headers();
             let BrowserDownload { url, file_name, .. } = download;
             let incoming = Incoming { url, file_name, headers, media };
-            let prefs = app.state::<PrefsStore>().get();
-            match prefs.target_dir().filter(|_| !prefs.confirm_browser_downloads) {
-                Some(dir) => {
-                    tauri::async_runtime::spawn(add_now(app.clone(), incoming, dir));
+            match app.state::<PrefsStore>().get().confirm_browser_downloads {
+                true => confirm(app, incoming),
+                false => {
+                    tauri::async_runtime::spawn(add_now(app.clone(), incoming));
                 }
-                None => confirm(app, incoming),
             }
         }
         Request::Inspect(page) => {
@@ -117,7 +119,10 @@ fn confirm(app: &AppHandle, incoming: Incoming) {
 
 /// Adds the download without asking. One that can't be added goes to the add dialog instead,
 /// which shows why.
-async fn add_now(app: AppHandle, incoming: Incoming, dir: PathBuf) {
+async fn add_now(app: AppHandle, incoming: Incoming) {
+    let Some(dir) = target_dir(&app, &incoming).await else {
+        return confirm(&app, incoming);
+    };
     let mut new = NewDownload::new(&incoming.url, dir);
     new.file_name = incoming.file_name.clone();
     new.headers = incoming.headers.clone();
@@ -135,6 +140,20 @@ async fn add_now(app: AppHandle, incoming: Incoming, dir: PathBuf) {
             confirm(&app, incoming);
         }
     }
+}
+
+/// The folder for the file's type. Asks the server for the name when the browser didn't say.
+async fn target_dir(app: &AppHandle, incoming: &Incoming) -> Option<PathBuf> {
+    let prefs = app.state::<PrefsStore>().get();
+    let media = incoming.media.is_some();
+    let mut name = incoming.file_name.clone();
+    if name.is_none() && !media && prefs.sort_by_type {
+        let engine = app.state::<Engine>();
+        name =
+            engine.inspect(&incoming.url, &incoming.headers).await.ok().and_then(|i| i.file_name);
+    }
+    let name = name.as_deref().or_else(|| categories::name_in_url(&incoming.url)).unwrap_or("");
+    prefs.target_dir(Category::of(name, media))
 }
 
 async fn respond(app: AppHandle, stream: impl AsyncRead + AsyncWrite + Unpin) {

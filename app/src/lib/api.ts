@@ -45,6 +45,8 @@ export interface DownloadRecord {
   /** Unix seconds. */
   addedAt: number;
   completedAt: number | null;
+  /** When it last started downloading. Null if never, or if added before this was kept. */
+  lastTryAt: number | null;
 }
 
 export interface Progress {
@@ -145,6 +147,10 @@ export interface Prefs {
   downloadDir: string | null;
   /** New downloads go to the folder used last instead of `downloadDir`. */
   rememberLastDir: boolean;
+  /** New downloads go to a folder for their file type. Wins over `rememberLastDir`. */
+  sortByType: boolean;
+  /** Folders picked for some file types; the others use a subfolder of `downloadDir`. */
+  categoryDirs: Partial<Record<Category, string>>;
   /** Browser downloads wait in the add dialog instead of starting right away. */
   confirmBrowserDownloads: boolean;
   closeToTray: boolean;
@@ -153,9 +159,37 @@ export interface Prefs {
   checkUpdates: boolean;
 }
 
+export type Category = "video" | "music" | "compressed" | "documents" | "programs" | "other";
+
+/** A file type that downloads are sorted by. */
+export interface CategoryInfo {
+  id: Category;
+  /** Also the name of its subfolder. */
+  name: string;
+  /** Lower-case, without the dot. */
+  extensions: string[];
+}
+
 export interface UpdateInfo {
   version: string;
   notes: string | null;
+}
+
+/** What the computer or app does once a queue finishes. */
+export type FinishAction = "shutdown" | "sleep" | "hibernate" | "quit";
+
+export const FINISH_LABELS: Record<FinishAction, string> = {
+  shutdown: "Shut down",
+  sleep: "Sleep",
+  hibernate: "Hibernate",
+  quit: "Quit InternetBlazer",
+};
+
+/** A queue finished; its action happens after `seconds` unless cancelled. */
+export interface Countdown {
+  queue: string;
+  action: FinishAction;
+  seconds: number;
 }
 
 export type EngineEvent =
@@ -192,8 +226,10 @@ export interface Incoming {
 export const api = {
   list: () => invoke<DownloadRecord[]>("list_downloads"),
   get: (id: number) => invoke<DownloadRecord>("get_download", { id }),
-  /** The folder the add dialog starts in. */
-  defaultDir: () => invoke<string | null>("default_dir"),
+  /** The folder the add dialog suggests for a file, going by its name. */
+  defaultDir: (fileName: string, media: boolean) =>
+    invoke<string | null>("default_dir", { fileName, media }),
+  fileCategories: () => invoke<CategoryInfo[]>("file_categories"),
   /** The system's Downloads folder. */
   systemDownloadDir: () => invoke<string | null>("system_download_dir"),
   inspect: (url: string, headers: [string, string][]) =>
@@ -221,6 +257,13 @@ export const api = {
   removeQueue: (id: number) => invoke<void>("remove_queue", { id }),
   startQueue: (id: number) => invoke<void>("start_queue", { id }),
   stopQueue: (id: number) => invoke<void>("stop_queue", { id }),
+  /** The queues that do something when they finish. */
+  finishActions: () => invoke<Record<number, FinishAction>>("finish_actions"),
+  /** Happens once, the next time the queue finishes; `null` clears it. */
+  setFinishAction: (queue: number, action: FinishAction | null) =>
+    invoke<void>("set_finish_action", { queue, action }),
+  cancelFinish: () => invoke<void>("cancel_finish"),
+  finishNow: () => invoke<void>("finish_now"),
   settings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<void>("set_settings", { settings }),
   setSpeedLimit: (limit: number | null) => invoke<void>("set_speed_limit", { limit }),
@@ -259,6 +302,17 @@ export function onResync(handler: () => void): Promise<UnlistenFn> {
 /** Fired when the browser handed over downloads; take them with `api.takeBrowserDownloads`. */
 export function onBrowserDownload(handler: () => void): Promise<UnlistenFn> {
   return listen("browser-download", handler);
+}
+
+export function onFinishActions(
+  handler: (actions: Record<number, FinishAction>) => void,
+): Promise<UnlistenFn> {
+  return listen<Record<number, FinishAction>>("finish-actions", (e) => handler(e.payload));
+}
+
+/** A queue's finish action is counting down, or `null` once it's done or cancelled. */
+export function onFinishCountdown(handler: (countdown: Countdown | null) => void): Promise<UnlistenFn> {
+  return listen<Countdown | null>("finish-countdown", (e) => handler(e.payload));
 }
 
 /** "About InternetBlazer" in the tray menu. */

@@ -1,22 +1,30 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, type Snippet } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import AddDialog from "./lib/AddDialog.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import {
     api,
+    type Category,
+    type Countdown,
+    FINISH_LABELS,
+    type FinishAction,
     type Incoming,
     MAIN_QUEUE,
     onBrowserDownload,
+    onFinishActions,
+    onFinishCountdown,
     onShowAbout,
     type Queue,
     type UpdateInfo,
   } from "./lib/api";
   import Details from "./lib/Details.svelte";
   import FileIcon from "./lib/FileIcon.svelte";
+  import FinishDialog from "./lib/FinishDialog.svelte";
   import {
     downloads,
     eta,
+    type Filter,
     FILTERS,
     inView,
     percent,
@@ -25,8 +33,8 @@
     type Item,
     type View,
   } from "./lib/downloads.svelte";
-  import { bytes, duration } from "./lib/format";
-  import Icon from "./lib/Icon.svelte";
+  import { bytes, date, duration, shortDate } from "./lib/format";
+  import Icon, { type IconName } from "./lib/Icon.svelte";
   import MoveDialog from "./lib/MoveDialog.svelte";
   import PropertiesDialog from "./lib/PropertiesDialog.svelte";
   import QueueDialog from "./lib/QueueDialog.svelte";
@@ -37,6 +45,9 @@
   import SpeedLimitDialog from "./lib/SpeedLimitDialog.svelte";
   import UrlDialog from "./lib/UrlDialog.svelte";
   import { clock } from "./lib/clock.svelte";
+  import { COLUMNS, columns } from "./lib/columns.svelte";
+  import { detailsPanel } from "./lib/detailsPanel.svelte";
+  import { sidebar, type Section } from "./lib/sidebar.svelte";
 
   let view = $state<View>({ filter: "all" });
   const selected = new SvelteSet<number>();
@@ -54,6 +65,9 @@
   let urlDialog = $state<Item | null>(null);
   let settingsOpen = $state(false);
   let aboutOpen = $state(false);
+  /** What each queue does the next time it finishes. */
+  let finishActions = $state<Record<number, FinishAction>>({});
+  let countdown = $state<Countdown | null>(null);
   /** The download being moved or renamed. */
   let moveDialog = $state<Item | null>(null);
   /** The download whose properties are shown; looked up live, so they stay current. */
@@ -73,6 +87,23 @@
   });
   let selection = $derived(visible.filter((item) => selected.has(item.id)));
   let single = $derived(selection.length === 1 ? selection[0] : null);
+  let panel: HTMLElement | undefined = $state();
+
+  const FILTER_ICONS: Record<Filter, IconName> = {
+    all: "list",
+    active: "download",
+    paused: "pause",
+    completed: "check",
+    failed: "alert",
+  };
+  const CATEGORY_ICONS: Record<Category, IconName> = {
+    video: "film",
+    music: "music",
+    compressed: "archive",
+    documents: "document",
+    programs: "apps",
+    other: "file",
+  };
   let activeCount = $derived(
     downloads.sorted.filter((i) => ["downloading", "queued", "retrying"].includes(i.status)).length,
   );
@@ -98,6 +129,9 @@
     // Also takes those that arrived before the listener, such as the one that started the app.
     unlistenBrowser.then(takeIncoming);
     const unlistenAbout = onShowAbout(() => (aboutOpen = true));
+    const unlistenActions = onFinishActions((a) => (finishActions = a));
+    const unlistenCountdown = onFinishCountdown((c) => (countdown = c));
+    api.finishActions().then((a) => (finishActions = a)).catch(showError);
     // Quietly: being offline is no reason to bother anyone at start.
     api
       .prefs()
@@ -108,6 +142,8 @@
       disconnect.then((f) => f());
       unlistenBrowser.then((f) => f());
       unlistenAbout.then((f) => f());
+      unlistenActions.then((f) => f());
+      unlistenCountdown.then((f) => f());
     };
   });
 
@@ -260,6 +296,8 @@
   }
   const startQueue = (q: Queue) => api.startQueue(q.id).catch(showError);
   const stopQueue = (q: Queue) => api.stopQueue(q.id).catch(showError);
+  const setFinish = (q: Queue, action: string) =>
+    api.setFinishAction(q.id, (action || null) as FinishAction | null).catch(showError);
 
   function saveLimit(limit: number | null) {
     const target = limitDialog;
@@ -324,6 +362,7 @@
       urlDialog ||
       settingsOpen ||
       aboutOpen ||
+      countdown ||
       moveDialog ||
       propertiesItem
     ) {
@@ -356,35 +395,81 @@
   }
 
   function isCurrent(v: View) {
-    return "queue" in v
-      ? "queue" in view && view.queue === v.queue
-      : "filter" in view && view.filter === v.filter;
+    if ("queue" in v) return "queue" in view && view.queue === v.queue;
+    if ("category" in v) return "category" in view && view.category === v.category;
+    return "filter" in view && view.filter === v.filter;
   }
 </script>
+
+{#snippet section(id: Section, title: string, extra?: Snippet)}
+  <div class="section">
+    <button class="fold" aria-expanded={sidebar.isOpen(id)} onclick={() => sidebar.toggle(id)}>
+      <Icon name="chevron" size={12} /><span>{title}</span>
+    </button>
+    {@render extra?.()}
+  </div>
+{/snippet}
+
+{#snippet item(v: View, icon: IconName, label: string, n: number)}
+  <button
+    class="filter"
+    class:current={isCurrent(v)}
+    onclick={() => (view = v)}
+    title={sidebar.narrow ? `${label} (${n})` : undefined}
+  >
+    <span class="queue-name"><Icon name={icon} size={16} /><span class="label">{label}</span></span>
+    <span class="count">{n}</span>
+  </button>
+{/snippet}
 
 <svelte:window {onkeydown} oncontextmenu={windowMenu} />
 
 <div class="shell">
-  <aside class="sidebar">
+  <aside class="sidebar" class:narrow={sidebar.narrow}>
     <div class="brand">
       <img class="logo" src={logo} alt="" />
-      InternetBlazer
+      <span class="label">InternetBlazer</span>
+      <button
+        class="icon fold-sidebar"
+        onclick={() => sidebar.toggleNarrow()}
+        aria-label={sidebar.narrow ? "Widen the sidebar" : "Narrow the sidebar to icons"}
+        title={sidebar.narrow ? "Widen the sidebar" : "Narrow the sidebar to icons"}
+      >
+        <Icon name="sidebar" size={16} />
+      </button>
     </div>
-    <button class="primary add" onclick={() => (adding = true)} title="Add download (Ctrl+N)">
-      <Icon name="plus" />Add download
+    <button
+      class="primary add"
+      onclick={() => (adding = true)}
+      title="Add download (Ctrl+N)"
+      aria-label="Add download"
+    >
+      <Icon name="plus" /><span class="label">Add download</span>
     </button>
     <nav aria-label="Filters">
-      {#each FILTERS as f (f.id)}
-        {@const v = { filter: f.id }}
-        <button class="filter" class:current={isCurrent(v)} onclick={() => (view = v)}>
-          <span>{f.label}</span>
-          <span class="count">{count(v)}</span>
-        </button>
-      {/each}
+      {@render section("filters", "Downloads")}
+      {#if sidebar.isOpen("filters")}
+        {#each FILTERS as f (f.id)}
+          {@const v = { filter: f.id }}
+          {@render item(v, FILTER_ICONS[f.id], f.label, count(v))}
+        {/each}
+      {/if}
+    </nav>
+    <nav aria-label="File types">
+      {@render section("types", "File types")}
+      {#if sidebar.isOpen("types")}
+        {#each downloads.categories as c (c.id)}
+          {@const v = { category: c.id }}
+          {@const n = count(v)}
+          <!-- Types with no downloads are left out, unless one is being looked at. -->
+          {#if n > 0 || isCurrent(v)}
+            {@render item(v, CATEGORY_ICONS[c.id], c.name, n)}
+          {/if}
+        {/each}
+      {/if}
     </nav>
     <nav aria-label="Queues">
-      <div class="section">
-        <span>Queues</span>
+      {#snippet newQueue()}
         <button
           class="icon"
           onclick={() => (queueDialog = { queue: null })}
@@ -393,28 +478,47 @@
         >
           <Icon name="plus" size={16} />
         </button>
-      </div>
-      {#each downloads.queues as q (q.id)}
-        {@const v = { queue: q.id }}
-        {@const running = queueRunning(q)}
-        <button class="filter" class:current={isCurrent(v)} onclick={() => (view = v)}>
-          <span class="queue-name">
-            <span class="dot" class:running title={running ? "Running" : "Stopped"}></span>
-            <span class="text">{q.name}</span>
-            {#if q.schedule.enabled}
-              <span class="muted" title="Scheduled"><Icon name="clock" size={14} /></span>
-            {/if}
-          </span>
-          <span class="count">{count(v)}</span>
-        </button>
-      {/each}
+      {/snippet}
+      {@render section("queues", "Queues", newQueue)}
+      {#if sidebar.isOpen("queues")}
+        {#each downloads.queues as q (q.id)}
+          {@const v = { queue: q.id }}
+          {@const running = queueRunning(q)}
+          {@const n = count(v)}
+          <button
+            class="filter"
+            class:current={isCurrent(v)}
+            onclick={() => (view = v)}
+            title={sidebar.narrow
+              ? `${q.name} (${running ? "running" : "stopped"}): ${n}` +
+                (finishActions[q.id] ? `
+When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
+              : undefined}
+          >
+            <span class="queue-name">
+              <span class="queue-icon"><Icon name="layers" size={16} /><span class="dot" class:running></span></span>
+              <span class="dot" class:running title={running ? "Running" : "Stopped"}></span>
+              <span class="text label">{q.name}</span>
+              {#if q.schedule.enabled}
+                <span class="muted label" title="Scheduled"><Icon name="clock" size={14} /></span>
+              {/if}
+              {#if finishActions[q.id]}
+                <span class="muted label" title="When done: {FINISH_LABELS[finishActions[q.id]]}">
+                  <Icon name="power" size={14} />
+                </span>
+              {/if}
+            </span>
+            <span class="count">{n}</span>
+          </button>
+        {/each}
+      {/if}
     </nav>
     <nav aria-label="App" class="settings">
-      <button class="filter" onclick={() => (settingsOpen = true)}>
-        <span class="queue-name"><Icon name="settings" size={16} />Settings</span>
+      <button class="filter" onclick={() => (settingsOpen = true)} title={sidebar.narrow ? "Settings" : undefined}>
+        <span class="queue-name"><Icon name="settings" size={16} /><span class="label">Settings</span></span>
       </button>
-      <button class="filter" onclick={() => (aboutOpen = true)}>
-        <span class="queue-name"><Icon name="info" size={16} />About</span>
+      <button class="filter" onclick={() => (aboutOpen = true)} title={sidebar.narrow ? "About" : undefined}>
+        <span class="queue-name"><Icon name="info" size={16} /><span class="label">About</span></span>
         {#if update}<span class="dot update" title="An update is available"></span>{/if}
       </button>
     </nav>
@@ -445,6 +549,14 @@
       <button onclick={() => single && showInFolder(single)} disabled={!single}>
         <Icon name="folder" />Show in folder
       </button>
+      <button
+        class:on={detailsPanel.shown}
+        aria-pressed={detailsPanel.shown}
+        onclick={() => detailsPanel.toggle()}
+        title="Show or hide the details of the selected download"
+      >
+        <Icon name="info" />Details
+      </button>
       <select
         class="move"
         value=""
@@ -470,6 +582,19 @@
           {q.maxActive} at a time{#if q.schedule.enabled}&nbsp;· on a schedule{/if}
         </span>
         <span class="spacer"></span>
+        <label class="when-done" title="Happens once, the next time the queue finishes, after a 30-second countdown">
+          <Icon name="power" size={16} />
+          <select
+            aria-label="When the queue is done"
+            value={finishActions[q.id] ?? ""}
+            onchange={(e) => setFinish(q, e.currentTarget.value)}
+          >
+            <option value="">When done: do nothing</option>
+            {#each Object.entries(FINISH_LABELS) as [value, label] (value)}
+              <option {value}>When done: {label}</option>
+            {/each}
+          </select>
+        </label>
         <button onclick={() => startQueue(q)} disabled={!inQueue(q, canResume)}>
           <Icon name="play" />Start queue
         </button>
@@ -489,17 +614,26 @@
       aria-multiselectable="true"
       aria-label="Downloads"
       oncontextmenu={listMenu}
+      style:--columns={columns.template}
     >
       <div class="head" aria-hidden="true">
-        <span>Name</span>
-        <span>Size</span>
-        <span>Progress</span>
-        <span class="num">Speed</span>
-        <span class="num">Time left</span>
+        {#each COLUMNS as c (c.id)}
+          <span class="col" class:num={c.num}>
+            {c.label}
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <span
+              class="grip"
+              title="Drag to resize; double-click for the usual width"
+              onpointerdown={(e) => columns.startResize(e, c.id)}
+              ondblclick={() => columns.reset(c.id)}
+            ></span>
+          </span>
+        {/each}
       </div>
       {#each visible as item (item.id)}
         {@const pct = percent(item)}
         {@const left = eta(item)}
+        {@const tried = item.lastTryAt ?? item.completedAt}
         <!-- Keyboard selection is handled by the window shortcuts. -->
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <div
@@ -551,6 +685,9 @@
           </span>
           <span class="num muted">{item.speed > 0 ? `${bytes(item.speed)}/s` : ""}</span>
           <span class="num muted">{left === null ? "" : duration(left)}</span>
+          <span class="muted nowrap" title={tried === null ? undefined : date(tried)}>
+            {tried === null ? "—" : shortDate(tried)}
+          </span>
         </div>
       {:else}
         <div class="empty">
@@ -565,9 +702,18 @@
       {/each}
     </div>
 
-    {#if single}
+    {#if single && detailsPanel.shown}
       {@const item = single}
-      <Details {item} onlimit={() => (limitDialog = item)} onaddress={() => (urlDialog = item)} />
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="panel-grip"
+        title="Drag to resize; double-click for the usual height"
+        onpointerdown={(e) => panel && detailsPanel.startResize(e, panel)}
+        ondblclick={() => detailsPanel.reset()}
+      ></div>
+      <div class="panel" class:sized={detailsPanel.height !== null} style:height={detailsPanel.height === null ? undefined : `${detailsPanel.height}px`} bind:this={panel}>
+        <Details {item} onlimit={() => (limitDialog = item)} onaddress={() => (urlDialog = item)} />
+      </div>
     {/if}
 
     <footer class="statusbar">
@@ -625,6 +771,11 @@
 {/if}
 {#if aboutOpen}
   <AboutDialog found={update} onclose={() => (aboutOpen = false)} />
+{/if}
+{#if countdown}
+  {#key countdown}
+    <FinishDialog {countdown} onerror={showError} />
+  {/key}
 {/if}
 {#if moveDialog}
   <MoveDialog item={moveDialog} onclose={() => (moveDialog = null)} />

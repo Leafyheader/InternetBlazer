@@ -24,6 +24,22 @@ export function date(unixSecs: number): string {
   return new Date(unixSecs * 1000).toLocaleString();
 }
 
+/** A compact date for a list: the time alone for today, the year only when it isn't this one. */
+export function shortDate(unixSecs: number): string {
+  const when = new Date(unixSecs * 1000);
+  const now = new Date();
+  if (when.toDateString() === now.toDateString()) {
+    return when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+  return when.toLocaleString(undefined, {
+    year: when.getFullYear() === now.getFullYear() ? undefined : "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 /** Upper-case extension for the file badge, or an empty string. */
 export function extension(fileName: string): string {
   const dot = fileName.lastIndexOf(".");

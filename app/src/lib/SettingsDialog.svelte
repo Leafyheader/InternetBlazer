@@ -1,7 +1,8 @@
 <script lang="ts">
   import { open as pickFolder } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { api, type MediaTools, type Prefs, type Settings } from "./api";
+  import { api, type Category, type MediaTools, type Prefs, type Settings } from "./api";
+  import { downloads } from "./downloads.svelte";
   import Icon from "./Icon.svelte";
 
   let { onclose }: { onclose: () => void } = $props();
@@ -77,6 +78,24 @@
     if (typeof picked === "string") prefs.downloadDir = picked;
   }
 
+  async function browseType(category: Category) {
+    if (!prefs) return;
+    const picked = await pickFolder({
+      directory: true,
+      defaultPath: prefs.categoryDirs[category] || typeDir(category) || undefined,
+    });
+    if (typeof picked === "string") prefs.categoryDirs[category] = picked;
+  }
+
+  /** The subfolder a file type uses when the user hasn't picked a folder for it. */
+  function typeDir(category: Category): string {
+    const base = prefs?.downloadDir?.trim() || systemDir;
+    const name = downloads.categories.find((c) => c.id === category)?.name ?? "";
+    if (!base) return "";
+    const sep = base.includes("\\") ? "\\" : "/";
+    return base.endsWith(sep) ? base + name : base + sep + name;
+  }
+
   async function submit(e: SubmitEvent) {
     e.preventDefault();
     if (!prefs || !settings) return;
@@ -84,7 +103,13 @@
     error = "";
     try {
       const downloadDir = prefs.downloadDir?.trim() || null;
-      await api.setPrefs({ ...prefs, downloadDir });
+      // A cleared folder goes back to the subfolder.
+      const categoryDirs = Object.fromEntries(
+        Object.entries(prefs.categoryDirs)
+          .map(([k, v]) => [k, v?.trim()])
+          .filter(([, v]) => v),
+      );
+      await api.setPrefs({ ...prefs, downloadDir, categoryDirs });
       await api.setSettings({
         ...settings,
         connections: Math.min(32, Math.max(1, Math.round(settings.connections ?? 8))),
@@ -122,9 +147,34 @@
           </div>
         </label>
         <label class="check">
-          <input type="checkbox" bind:checked={prefs.rememberLastDir} />
-          Start in the folder I used last
+          <input type="checkbox" bind:checked={prefs.sortByType} />
+          Sort downloads into folders by file type
         </label>
+        {#if prefs.sortByType}
+          {#each downloads.categories as c (c.id)}
+            <div class="inline type-folder">
+              <span class="type-name">{c.name}</span>
+              <input
+                bind:value={prefs.categoryDirs[c.id]}
+                placeholder={typeDir(c.id)}
+                aria-label="Folder for {c.name}"
+                spellcheck="false"
+              />
+              <button type="button" class="icon" onclick={() => browseType(c.id)} aria-label="Browse for the {c.name} folder" title="Browse">
+                <Icon name="folder" />
+              </button>
+            </div>
+          {/each}
+          <p class="hint muted">
+            Each type goes to a subfolder of the folder above unless you pick another. The download
+            dialog picks the folder from the file's name, and you can still change it there.
+          </p>
+        {:else}
+          <label class="check">
+            <input type="checkbox" bind:checked={prefs.rememberLastDir} />
+            Start in the folder I used last
+          </label>
+        {/if}
         <div class="inline">
           <label class="grow">
             <span>Connections per download</span>

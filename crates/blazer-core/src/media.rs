@@ -27,7 +27,7 @@ use crate::{
     limit::RateLimiter,
     segment::Segment,
     tools,
-    types::{DownloadRecord, Event, MediaChoice, MediaFormat, MediaInfo, Progress, Status},
+    types::{self, DownloadRecord, Event, MediaChoice, MediaFormat, MediaInfo, Progress, Status},
 };
 
 /// Prefixes the lines the engine asks yt-dlp to print, to tell them from anything else.
@@ -466,6 +466,7 @@ pub(crate) async fn execute(
     let format = record.media.ok_or_else(|| Error::internal("not a media download"))?;
     record.status = Status::Downloading;
     record.error = None;
+    record.last_try_at = Some(types::now());
     inner.save_running(record)?;
     inner.emit(Event::StatusChanged { id: record.id, status: record.status, error: None });
 
