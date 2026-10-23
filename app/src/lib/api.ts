@@ -149,6 +149,13 @@ export interface Prefs {
   confirmBrowserDownloads: boolean;
   closeToTray: boolean;
   notify: boolean;
+  /** Looks for a newer version each time the app starts. */
+  checkUpdates: boolean;
+}
+
+export interface UpdateInfo {
+  version: string;
+  notes: string | null;
 }
 
 export type EngineEvent =
@@ -222,6 +229,12 @@ export const api = {
   launchAtLogin: () => invoke<boolean>("get_launch_at_login"),
   setLaunchAtLogin: (enabled: boolean) => invoke<void>("set_launch_at_login", { enabled }),
   openLogFolder: () => invoke<void>("open_log_folder"),
+  openProjectPage: (page: "home" | "releases" | "issues" | "license") =>
+    invoke<void>("open_project_page", { page }),
+  /** Null when this is the newest version. */
+  checkUpdate: () => invoke<UpdateInfo | null>("check_update"),
+  /** Ends the app; the new version starts in its place. */
+  installUpdate: () => invoke<void>("install_update"),
   takeBrowserDownloads: () => invoke<Incoming[]>("take_browser_downloads"),
   openFile: (id: number) => invoke<void>("open_file", { id }),
   /** The system's "Open with" dialog; Windows only. */
@@ -246,4 +259,9 @@ export function onResync(handler: () => void): Promise<UnlistenFn> {
 /** Fired when the browser handed over downloads; take them with `api.takeBrowserDownloads`. */
 export function onBrowserDownload(handler: () => void): Promise<UnlistenFn> {
   return listen("browser-download", handler);
+}
+
+/** "About InternetBlazer" in the tray menu. */
+export function onShowAbout(handler: () => void): Promise<UnlistenFn> {
+  return listen("show-about", handler);
 }

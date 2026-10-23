@@ -23,6 +23,8 @@ pub struct Prefs {
     pub close_to_tray: bool,
     /// Desktop notifications when downloads finish or fail while the window is in the background.
     pub notify: bool,
+    /// Looks for a newer version each time the app starts.
+    pub check_updates: bool,
     /// Whether the user has been told that closing the window hides it.
     pub tray_notice_shown: bool,
 }
@@ -36,6 +38,7 @@ impl Default for Prefs {
             confirm_browser_downloads: true,
             close_to_tray: true,
             notify: true,
+            check_updates: true,
             tray_notice_shown: false,
         }
     }

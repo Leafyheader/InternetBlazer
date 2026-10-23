@@ -50,7 +50,10 @@ npm install
 npm run tauri dev                          # run with hot reload
 npm run tauri build -- --no-bundle         # release executable in target/release
 npm run check                              # type-check the frontend
+npm run package                            # Windows installer, with blazer-host, in target/release/bundle/nsis
 ```
+
+`npm run package` also signs the update files, so it needs the update key: set `TAURI_SIGNING_PRIVATE_KEY` to the key or its path, and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (empty for the project's key). The installer installs for the current user, without asking for admin rights. Uninstalling also unregisters blazer-host from the browsers.
 
 The app and the CLI share one download list, stored in your local app data folder. Only one of them can have it open at a time. Starting the app while it runs brings its window to the front. Downloads that were running or queued when the app last quit or crashed start again when it opens. The CLI never starts them on its own.
 
@@ -66,6 +69,9 @@ Settings, at the bottom of the sidebar:
 - **Video downloads:** the yt-dlp version, with a button to update it; deno, which yt-dlp needs for every YouTube quality, with a button to install it; and whether ffmpeg was found.
 - **Browser:** whether files from the extension wait in the download dialog or start right away in the default folder.
 - **Desktop:** starting at sign-in (hidden in the tray), keeping the app in the tray when the window is closed, and notifications when downloads finish or fail while the window is in the background.
+- **Updates:** whether to check for a newer version each time the app starts. A newer version found at start shows a notice with an install button, and a dot next to About.
+
+About, below Settings (also in the tray menu), shows the version, checks for updates and installs them, and links to the website, the release notes and the issue tracker. "Copy version info" copies what a bug report needs. Updates come from the GitHub releases and are only installed when signed with the project's update key. Running downloads pause for the update and carry on in the new version.
 
 The app keeps a log for each day, for a week, in the `logs` folder next to the download list. "Open log folder" in Settings shows it. Set `RUST_LOG=debug` for more detail.
 
@@ -108,6 +114,14 @@ blazer remove <ID> [--delete-files]
 
 Set `RUST_LOG=blazer_core=debug` to see retries and connection changes.
 
+## Releasing
+
+1. Raise `version` in the root `Cargo.toml` (the app takes its version from there) and in `app/package.json`.
+2. Commit, then push a tag with that version: `git tag v0.2.0 && git push origin v0.2.0`.
+3. The Release workflow builds the installer and drafts a GitHub release with it and `latest.json`. Publish the draft, and installed copies offer the update.
+
+The workflow needs the repository secret `TAURI_SIGNING_PRIVATE_KEY`, holding the contents of the update key. The project's key has no password, so `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` stays unset. Losing the key means installed copies can no longer be updated, so keep a backup. The CI workflow runs formatting, clippy and the tests on Windows, Linux and macOS for every push.
+
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+© 2026 Leafyhead Technologies. Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

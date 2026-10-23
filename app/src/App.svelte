@@ -3,7 +3,15 @@
   import { SvelteSet } from "svelte/reactivity";
   import AddDialog from "./lib/AddDialog.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
-  import { api, type Incoming, MAIN_QUEUE, onBrowserDownload, type Queue } from "./lib/api";
+  import {
+    api,
+    type Incoming,
+    MAIN_QUEUE,
+    onBrowserDownload,
+    onShowAbout,
+    type Queue,
+    type UpdateInfo,
+  } from "./lib/api";
   import Details from "./lib/Details.svelte";
   import FileIcon from "./lib/FileIcon.svelte";
   import {
@@ -23,6 +31,8 @@
   import PropertiesDialog from "./lib/PropertiesDialog.svelte";
   import QueueDialog from "./lib/QueueDialog.svelte";
   import RemoveDialog from "./lib/RemoveDialog.svelte";
+  import AboutDialog from "./lib/AboutDialog.svelte";
+  import logo from "./lib/logo.png";
   import SettingsDialog from "./lib/SettingsDialog.svelte";
   import SpeedLimitDialog from "./lib/SpeedLimitDialog.svelte";
   import UrlDialog from "./lib/UrlDialog.svelte";
@@ -43,6 +53,7 @@
   /** The download whose address is being changed. */
   let urlDialog = $state<Item | null>(null);
   let settingsOpen = $state(false);
+  let aboutOpen = $state(false);
   /** The download being moved or renamed. */
   let moveDialog = $state<Item | null>(null);
   /** The download whose properties are shown; looked up live, so they stay current. */
@@ -51,6 +62,9 @@
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let toast = $state("");
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  /** A newer version found when the app started. */
+  let update = $state<UpdateInfo | null>(null);
+  let installing = $state(false);
 
   let visible = $derived(downloads.sorted.filter((item) => inView(view, item)));
   let currentQueue = $derived.by(() => {
@@ -83,11 +97,29 @@
     const unlistenBrowser = onBrowserDownload(takeIncoming);
     // Also takes those that arrived before the listener, such as the one that started the app.
     unlistenBrowser.then(takeIncoming);
+    const unlistenAbout = onShowAbout(() => (aboutOpen = true));
+    // Quietly: being offline is no reason to bother anyone at start.
+    api
+      .prefs()
+      .then((p) => (p.checkUpdates ? api.checkUpdate() : null))
+      .then((u) => (update = u))
+      .catch(() => {});
     return () => {
       disconnect.then((f) => f());
       unlistenBrowser.then((f) => f());
+      unlistenAbout.then((f) => f());
     };
   });
+
+  async function installUpdate() {
+    installing = true;
+    try {
+      await api.installUpdate();
+    } catch (err) {
+      installing = false;
+      showError(`Couldn't install the update: ${err}`);
+    }
+  }
 
   function showError(err: unknown) {
     toast = String(err);
@@ -291,6 +323,7 @@
       limitDialog ||
       urlDialog ||
       settingsOpen ||
+      aboutOpen ||
       moveDialog ||
       propertiesItem
     ) {
@@ -334,7 +367,7 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand">
-      <span class="logo"><Icon name="download" size={16} /></span>
+      <img class="logo" src={logo} alt="" />
       InternetBlazer
     </div>
     <button class="primary add" onclick={() => (adding = true)} title="Add download (Ctrl+N)">
@@ -376,9 +409,15 @@
         </button>
       {/each}
     </nav>
-    <button class="filter settings" onclick={() => (settingsOpen = true)}>
-      <span class="queue-name"><Icon name="settings" size={16} />Settings</span>
-    </button>
+    <nav aria-label="App" class="settings">
+      <button class="filter" onclick={() => (settingsOpen = true)}>
+        <span class="queue-name"><Icon name="settings" size={16} />Settings</span>
+      </button>
+      <button class="filter" onclick={() => (aboutOpen = true)}>
+        <span class="queue-name"><Icon name="info" size={16} />About</span>
+        {#if update}<span class="dot update" title="An update is available"></span>{/if}
+      </button>
+    </nav>
   </aside>
 
   <main>
@@ -584,6 +623,9 @@
 {#if settingsOpen}
   <SettingsDialog onclose={() => (settingsOpen = false)} />
 {/if}
+{#if aboutOpen}
+  <AboutDialog found={update} onclose={() => (aboutOpen = false)} />
+{/if}
 {#if moveDialog}
   <MoveDialog item={moveDialog} onclose={() => (moveDialog = null)} />
 {/if}
@@ -601,6 +643,13 @@
 {/if}
 {#if removing}
   <RemoveDialog items={removing} onclose={() => (removing = null)} />
+{/if}
+{#if update && !toast}
+  <div class="toast" role="status">
+    <span>{installing ? "Downloading the update…" : `InternetBlazer ${update.version} is available.`}</span>
+    <button class="primary" onclick={installUpdate} disabled={installing}>Install and restart</button>
+    <button class="icon" onclick={() => (update = null)} aria-label="Later"><Icon name="close" size={16} /></button>
+  </div>
 {/if}
 {#if toast}
   <div class="toast" role="alert">

@@ -8,7 +8,7 @@ use std::{
 
 use blazer_core::{DownloadId, Engine, Event, Status};
 use tauri::{
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -23,9 +23,10 @@ const TOOLTIP_INTERVAL: Duration = Duration::from_secs(1);
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Open InternetBlazer", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, "pause-all", "Pause all downloads", true, None::<&str>)?;
+    let about = MenuItem::with_id(app, "about", "About InternetBlazer", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &pause, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &pause, &about, &separator, &quit])?;
     let mut tray = TrayIconBuilder::with_id(ID)
         .tooltip(NAME)
         .menu(&menu)
@@ -33,6 +34,10 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_window(app),
             "pause-all" => pause_all(app),
+            "about" => {
+                show_window(app);
+                let _ = app.emit("show-about", ());
+            }
             "quit" => app.exit(0),
             _ => {}
         })

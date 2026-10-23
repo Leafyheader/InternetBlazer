@@ -22,11 +22,12 @@ use blazer_core::{
 };
 use bridge::{Bridge, Incoming};
 use prefs::{Prefs, PrefsStore};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, ipc::Response};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::broadcast::error::RecvError;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -277,6 +278,49 @@ fn open_log_folder(app: AppHandle) -> CmdResult<()> {
     app.opener().open_path(dir.to_string_lossy(), None::<&str>).map_err(message)
 }
 
+const PROJECT_URL: &str = "https://github.com/Leafyheader/InternetBlazer";
+
+/// Opens one of the project's pages in the browser. Only these pages, so the window can't
+/// open arbitrary addresses.
+#[tauri::command]
+fn open_project_page(app: AppHandle, page: &str) -> CmdResult<()> {
+    let path = match page {
+        "home" => "",
+        "releases" => "/releases",
+        "issues" => "/issues",
+        "license" => "#license",
+        _ => return Err(format!("Unknown page: {page}")),
+    };
+    app.opener().open_url(format!("{PROJECT_URL}{path}"), None::<&str>).map_err(message)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
+}
+
+/// Asks GitHub for a newer release.
+#[tauri::command]
+async fn check_update(app: AppHandle) -> CmdResult<Option<UpdateInfo>> {
+    let update = app.updater().map_err(message)?.check().await.map_err(message)?;
+    Ok(update.map(|u| UpdateInfo { version: u.version, notes: u.body }))
+}
+
+/// Downloads the newer release and installs it, which ends the app and starts the new one.
+#[tauri::command]
+async fn install_update(app: AppHandle, engine: State<'_, Engine>) -> CmdResult<()> {
+    let update = app.updater().map_err(message)?.check().await.map_err(message)?;
+    let update = update.ok_or("InternetBlazer is up to date.")?;
+    let bytes = update.download(|_, _| {}, || {}).await.map_err(message)?;
+    // The installer ends the process without the exit event, so downloads checkpoint now and
+    // carry on in the new version.
+    engine.inner().clone().shutdown().await;
+    update.install(bytes).map_err(message)?;
+    app.restart()
+}
+
 #[tauri::command]
 async fn set_speed_limit(engine: State<'_, Engine>, limit: Option<u64>) -> CmdResult<()> {
     engine.set_speed_limit(limit).map_err(message)
@@ -498,6 +542,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().arg(HIDDEN_ARG).build())
         .setup(|app| {
             let db = db_path()?;
@@ -572,6 +617,9 @@ fn main() {
             get_launch_at_login,
             set_launch_at_login,
             open_log_folder,
+            open_project_page,
+            check_update,
+            install_update,
             take_browser_downloads,
             open_file,
             open_with,

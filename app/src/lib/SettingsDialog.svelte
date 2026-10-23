@@ -229,6 +229,17 @@
           Notify me when downloads finish or fail
         </label>
       </fieldset>
+
+      <fieldset>
+        <legend>Updates</legend>
+        <label class="check">
+          <input type="checkbox" bind:checked={prefs.checkUpdates} />
+          Check for updates when the app starts
+        </label>
+        <p class="hint muted">
+          A newer version shows a notice with an install button. To check now, open About.
+        </p>
+      </fieldset>
     {:else if !error}
       <p class="muted">Loading…</p>
     {/if}
