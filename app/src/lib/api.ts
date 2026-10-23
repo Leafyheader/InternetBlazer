@@ -56,6 +56,12 @@ export interface Progress {
   /** Bytes per second. */
   speed: number;
   connections: number;
+  /** Connections the download set out to use: the setting, or 1 when the server can't send parts. */
+  planned: number;
+  /** Connections given up because the server asked for fewer. */
+  refused: number;
+  /** Connections that found no part left worth splitting off, near the end or for a small file. */
+  idle: number;
   /** Nothing has arrived for a few seconds, and not because of a speed limit. */
   stalled: boolean;
   /** While stalled: why connections last failed, such as the network being down. */

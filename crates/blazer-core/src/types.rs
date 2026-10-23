@@ -133,6 +133,13 @@ pub struct Progress {
     pub speed: u64,
     /// Connections currently receiving data.
     pub connections: usize,
+    /// Connections the download set out to use: the setting, or 1 when the server can't send
+    /// the file in parts.
+    pub planned: usize,
+    /// Connections given up because the server asked for fewer.
+    pub refused: usize,
+    /// Connections that found no part left worth splitting off, near the end or for a small file.
+    pub idle: usize,
     /// Nothing has arrived for a few seconds, and not because of a speed limit.
     pub stalled: bool,
     /// While stalled: the latest reason a connection failed, such as the network being down.

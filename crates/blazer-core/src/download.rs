@@ -61,6 +61,10 @@ struct Shared {
     fatal: Mutex<Option<Error>>,
     /// Workers still running.
     workers: AtomicUsize,
+    /// What the download set out with, before the server refused some and others ran out of work.
+    planned: usize,
+    refused: AtomicUsize,
+    idle: AtomicUsize,
     connections: AtomicUsize,
     /// Bytes received so far, counted before they are written, so that slow progress shows
     /// before a write buffer fills.
@@ -228,6 +232,9 @@ async fn execute(
         stop: cancel.child_token(),
         fatal: Mutex::new(None),
         workers: AtomicUsize::new(worker_count),
+        planned: worker_count,
+        refused: AtomicUsize::new(0),
+        idle: AtomicUsize::new(0),
         connections: AtomicUsize::new(0),
         received: AtomicU64::new(0),
         throttled: AtomicUsize::new(0),
@@ -355,7 +362,10 @@ async fn worker_loop(sh: &Shared) -> Result<Exit> {
         if sh.stop.is_cancelled() {
             return Ok(Exit::Finished);
         }
-        let Some(claim) = sh.plan.lock().claim() else { return Ok(Exit::Finished) };
+        let Some(claim) = sh.plan.lock().claim() else {
+            sh.idle.fetch_add(1, Ordering::Relaxed);
+            return Ok(Exit::Finished);
+        };
         let result = fetch(sh, claim, &mut buf, &mut failures).await;
         // Such as a server found out on the last bytes, which must not pass as complete.
         let fatal = matches!(&result, Err(e) if !e.is_retryable());
@@ -380,6 +390,7 @@ async fn worker_loop(sh: &Shared) -> Result<Exit> {
                     .is_ok() =>
             {
                 tracing::debug!("server is throttling; dropping a connection");
+                sh.refused.fetch_add(1, Ordering::Relaxed);
                 return Ok(Exit::Retired);
             }
             Err(e) if e.is_retryable() && failures < sh.max_retries => {
@@ -601,6 +612,9 @@ async fn report(
             total: record.total,
             speed: speed as u64,
             connections: shared.connections.load(Ordering::Relaxed),
+            planned: shared.planned,
+            refused: shared.refused.load(Ordering::Relaxed),
+            idle: shared.idle.load(Ordering::Relaxed),
             stalled,
             problem: if stalled { shared.trouble.lock().clone() } else { None },
             segments: segments.clone(),

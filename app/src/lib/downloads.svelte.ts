@@ -17,6 +17,10 @@ export interface Item extends DownloadRecord {
   speed: number;
   /** Connections currently receiving data. */
   activeConnections: number;
+  /** While downloading, as in the engine's progress events. */
+  planned: number;
+  refused: number;
+  idle: number;
   /** While downloading: nothing has arrived for a few seconds. */
   stalled: boolean;
   /** While stalled: why connections last failed. */
@@ -57,6 +61,9 @@ function toItem(record: DownloadRecord, previous?: Item): Item {
     downloaded,
     speed: running ? (previous?.speed ?? 0) : 0,
     activeConnections: running ? (previous?.activeConnections ?? 0) : 0,
+    planned: running ? (previous?.planned ?? 0) : 0,
+    refused: running ? (previous?.refused ?? 0) : 0,
+    idle: running ? (previous?.idle ?? 0) : 0,
     stalled: running && (previous?.stalled ?? false),
     problem: running ? (previous?.problem ?? null) : null,
   };
@@ -130,6 +137,9 @@ class Downloads {
             item.total = event.total;
             item.speed = event.speed;
             item.activeConnections = event.connections;
+            item.planned = event.planned;
+            item.refused = event.refused;
+            item.idle = event.idle;
             item.stalled = event.stalled;
             item.problem = event.problem;
             item.segments = event.segments;
@@ -143,6 +153,9 @@ class Downloads {
             if (event.status !== "downloading") {
               item.speed = 0;
               item.activeConnections = 0;
+              item.planned = 0;
+              item.refused = 0;
+              item.idle = 0;
               item.stalled = false;
               item.problem = null;
             }

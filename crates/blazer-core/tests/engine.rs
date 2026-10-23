@@ -23,7 +23,7 @@ use blazer_core::{
     Settings, Status, Store,
 };
 use bytes::Bytes;
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 const CHUNK: usize = 16 * 1024;
 
@@ -482,6 +482,7 @@ async fn sheds_connections_when_the_server_throttles() {
 
     let mut new = NewDownload::new(&url, tmp.path());
     new.connections = Some(8);
+    let mut events = engine.subscribe();
     let id = engine.add(new).await.unwrap();
     let record = engine.wait(id).await.unwrap();
 
@@ -490,6 +491,18 @@ async fn sheds_connections_when_the_server_throttles() {
     // Each extra connection is refused about once, then gives up instead of retrying forever.
     let throttled = server.throttled.load(Ordering::Relaxed);
     assert!(throttled <= 12, "server throttled {throttled} requests");
+    // Progress tells why the download runs on fewer connections than it asked for.
+    let mut last = None;
+    loop {
+        match events.try_recv() {
+            Ok(Event::Progress(p)) if p.id == id => last = Some(p),
+            Ok(_) | Err(TryRecvError::Lagged(_)) => {}
+            Err(_) => break,
+        }
+    }
+    let last = last.expect("progress was reported");
+    assert_eq!(last.planned, 8);
+    assert!((1..8).contains(&last.refused), "refused {}", last.refused);
 }
 
 /// Waits until none of the downloads is queued, running or waiting to retry.

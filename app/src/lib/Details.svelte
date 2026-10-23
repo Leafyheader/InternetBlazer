@@ -13,6 +13,34 @@
   let canChangeAddress = $derived(["paused", "failed", "retrying"].includes(item.status));
   let wait = $derived(retryIn(item, clock.now));
 
+  /** A speed this close to a limit counts as held back by it. */
+  const AT_LIMIT = 0.8;
+
+  const downloadsText = (n: number) => (n === 1 ? "1 other download" : `${n} other downloads`);
+
+  /** What most likely sets the pace of a running download, most telling first. */
+  let pace = $derived.by(() => {
+    // No progress report yet, or it shows its own trouble.
+    if (item.status !== "downloading" || item.planned === 0 || item.stalled || item.problem) return null;
+    const others = downloads.sorted.filter((i) => i.status === "downloading" && i.id !== item.id).length;
+    if (item.speedLimit !== null && item.speed >= item.speedLimit * AT_LIMIT) {
+      return "held to this download's speed limit";
+    }
+    if (downloads.speedLimit !== null && downloads.totalSpeed >= downloads.speedLimit * AT_LIMIT) {
+      return others ? `held to the overall speed limit, shared with ${downloadsText(others)}` : "held to the overall speed limit";
+    }
+    if (item.media) return "yt-dlp downloads it, at the pace the site allows";
+    if (!item.resumable) return "the server sends this file over one connection only";
+    if (item.total === null) return "the server didn't say the size, so it comes over one connection";
+    if (item.planned === 1) return "set to use one connection";
+    if (item.refused > 0) {
+      return `the server allows only ${item.planned - item.refused} of ${item.planned} connections`;
+    }
+    if (item.idle > 0) return "what's left is too small to split among more connections";
+    if (others) return `sharing your internet with ${downloadsText(others)}`;
+    return `using all ${item.planned} connections; the server and your network set the pace`;
+  });
+
   let path = $derived.by(() => {
     const sep = item.dir.includes("\\") ? "\\" : "/";
     return item.dir.replace(/[\\/]$/, "") + sep + item.fileName;
@@ -62,6 +90,10 @@
         · attempt {item.retry.attempt}, {wait ? `in ${duration(wait)}` : "starting"}
       {/if}
     </dd>
+    {#if pace}
+      <dt>Speed</dt>
+      <dd>{bytes(item.speed)}/s · {pace}</dd>
+    {/if}
     {#if item.media}
       <dt>Video</dt>
       <dd>{quality(item.media)} · downloaded by yt-dlp</dd>
