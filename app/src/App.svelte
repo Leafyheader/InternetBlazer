@@ -2,6 +2,7 @@
   import { onMount, type Snippet } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import AddDialog from "./lib/AddDialog.svelte";
+  import ImportDialog, { findLinks } from "./lib/ImportDialog.svelte";
   import ContextMenu, { type MenuItem } from "./lib/ContextMenu.svelte";
   import {
     api,
@@ -54,6 +55,10 @@
   /** Where a Shift+click range starts. */
   let anchor: number | null = null;
   let adding = $state(false);
+  /** A link pasted into the window, for the add dialog. */
+  let pastedUrl = $state("");
+  /** The import dialog, with the text pasted into the window, if any. */
+  let importing = $state<string | null>(null);
   /** Downloads from the browser, confirmed one at a time in the add dialog. */
   let incoming = $state<Incoming[]>([]);
   let removing = $state<Item[] | null>(null);
@@ -263,6 +268,7 @@
     selected.clear();
     openMenu(e.clientX, e.clientY, [
       { label: "Add download…", icon: "plus", hint: "Ctrl+N", action: () => (adding = true) },
+      { label: "Import links…", icon: "links", hint: "Ctrl+I", action: () => (importing = "") },
       {
         label: "Select all",
         hint: "Ctrl+A",
@@ -355,6 +361,7 @@
     }
     if (
       adding ||
+      importing !== null ||
       incoming.length > 0 ||
       removing ||
       queueDialog ||
@@ -374,6 +381,9 @@
     if (ctrl && e.key.toLowerCase() === "n") {
       e.preventDefault();
       adding = true;
+    } else if (ctrl && !e.shiftKey && e.key.toLowerCase() === "i") {
+      e.preventDefault();
+      importing = "";
     } else if (ctrl && e.key.toLowerCase() === "a") {
       e.preventDefault();
       visible.forEach((i) => selected.add(i.id));
@@ -387,6 +397,22 @@
       e.preventDefault();
       const row = document.querySelector(".row.selected")?.getBoundingClientRect();
       if (row) openMenu(row.left + 40, row.bottom, downloadMenu());
+    }
+  }
+
+  /** Links pasted into the window, outside a text field, open the add or import dialog. */
+  function onpaste(e: ClipboardEvent) {
+    const target = e.target as HTMLElement;
+    if (document.querySelector("dialog[open]") || target.closest("input, textarea, select")) return;
+    const text = e.clipboardData?.getData("text") ?? "";
+    const links = findLinks(text);
+    if (links.length === 0) return;
+    e.preventDefault();
+    if (links.length === 1) {
+      pastedUrl = links[0];
+      adding = true;
+    } else {
+      importing = text;
     }
   }
 
@@ -422,7 +448,7 @@
   </button>
 {/snippet}
 
-<svelte:window {onkeydown} oncontextmenu={windowMenu} />
+<svelte:window {onkeydown} {onpaste} oncontextmenu={windowMenu} />
 
 <div class="shell">
   <aside class="sidebar" class:narrow={sidebar.narrow}>
@@ -438,14 +464,19 @@
         <Icon name="sidebar" size={16} />
       </button>
     </div>
-    <button
-      class="primary add"
-      onclick={() => (adding = true)}
-      title="Add download (Ctrl+N)"
-      aria-label="Add download"
-    >
-      <Icon name="plus" /><span class="label">Add download</span>
-    </button>
+    <div class="add-row">
+      <button
+        class="primary add"
+        onclick={() => (adding = true)}
+        title="Add download (Ctrl+N)"
+        aria-label="Add download"
+      >
+        <Icon name="plus" /><span class="label">Add download</span>
+      </button>
+      <button class="add" onclick={() => (importing = "")} title="Import links (Ctrl+I)" aria-label="Import links">
+        <Icon name="links" />
+      </button>
+    </div>
     <nav aria-label="Filters">
       {@render section("filters", "Downloads")}
       {#if sidebar.isOpen("filters")}
@@ -694,7 +725,10 @@ When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
           {#if downloads.sorted.length === 0}
             <Icon name="download" size={40} />
             <p>No downloads yet.</p>
-            <button class="primary" onclick={() => (adding = true)}><Icon name="plus" />Add download</button>
+            <div class="empty-actions">
+              <button class="primary" onclick={() => (adding = true)}><Icon name="plus" />Add download</button>
+              <button onclick={() => (importing = "")}><Icon name="links" />Import links</button>
+            </div>
           {:else}
             <p>Nothing here.</p>
           {/if}
@@ -734,7 +768,16 @@ When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
 </div>
 
 {#if adding}
-  <AddDialog queue={currentQueue?.id ?? MAIN_QUEUE} onclose={() => (adding = false)} />
+  <AddDialog
+    queue={currentQueue?.id ?? MAIN_QUEUE}
+    url={pastedUrl}
+    onclose={() => {
+      adding = false;
+      pastedUrl = "";
+    }}
+  />
+{:else if importing !== null}
+  <ImportDialog queue={currentQueue?.id ?? MAIN_QUEUE} text={importing} onclose={() => (importing = null)} />
 {:else if incoming.length > 0}
   {#key incoming[0]}
     <AddDialog prefill={incoming[0]} onclose={() => incoming.shift()} />

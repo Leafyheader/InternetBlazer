@@ -90,7 +90,8 @@ button:disabled {
 }
 button:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
@@ -115,8 +116,9 @@ button.icon {
   padding: 4px;
 }
 
-input:not([type="checkbox"]),
-select {
+input:not([type="checkbox"], [type="radio"]),
+select,
+textarea {
   font: inherit;
   color: inherit;
   width: 100%;
@@ -125,8 +127,12 @@ select {
   border-radius: 6px;
   background: var(--bg);
 }
-input[type="checkbox"] {
+input[type="checkbox"],
+input[type="radio"] {
   accent-color: var(--accent);
+}
+textarea {
+  resize: vertical;
 }
 input:disabled,
 select:disabled {
@@ -554,6 +560,10 @@ main {
 .empty p {
   margin: 0;
 }
+.empty-actions {
+  display: flex;
+  gap: 8px;
+}
 
 /* Details */
 
@@ -889,6 +899,64 @@ dialog footer {
   height: 1px;
   margin: 4px 6px;
   background: var(--border);
+}
+
+/* The import dialog's list of links. */
+dialog.import {
+  width: min(600px, calc(100vw - 32px));
+}
+.links {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.link-list {
+  max-height: 220px;
+  margin: 0;
+  padding: 4px 0;
+  overflow-y: auto;
+  list-style: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.link-list li {
+  padding: 4px 10px;
+}
+.link-list .link-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  color: var(--text);
+}
+.link-list .link-name,
+.link-list .link-url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.link-list .link-url {
+  font-size: 12px;
+  color: var(--muted);
+}
+.link-list .link-url.warn-text {
+  color: var(--warn);
+  white-space: normal;
+}
+.link-list .tag {
+  flex: none;
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.sidebar .add-row {
+  display: flex;
+  gap: 6px;
+}
+.sidebar .add-row .add {
+  flex: 1;
+}
+.sidebar.narrow .add-row {
+  flex-direction: column;
 }
 
 /* The details panel, shown in the properties dialog. */

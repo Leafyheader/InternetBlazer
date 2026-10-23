@@ -1,10 +1,12 @@
 use std::{
-    path::PathBuf,
+    collections::{HashMap, HashSet},
+    io::Read,
+    path::{Path, PathBuf},
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use blazer_core::{
     Config, DownloadId, DownloadRecord, Engine, Event, MediaFormat, NewDownload, Progress, Status,
 };
@@ -23,9 +25,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Download a URL.
+    /// Download a URL, or every link in a text file.
     Get {
-        url: String,
+        /// The link to download. Leave it out when using --input.
+        #[arg(required_unless_present = "input")]
+        url: Option<String>,
+        /// Download every link in a text file instead, such as a list copied from a web page.
+        /// Other text around the links is ignored. `-` reads the links from standard input.
+        #[arg(short = 'i', long, value_name = "FILE", conflicts_with_all = ["url", "output"])]
+        input: Option<PathBuf>,
         /// Directory to save into. Defaults to your Downloads folder.
         #[arg(short = 'd', long)]
         dir: Option<PathBuf>,
@@ -100,7 +108,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         .with_context(|| format!("opening {}", db.display()))?;
 
     let code = match cli.command {
-        Command::Get { url, dir, output, connections, limit, media } => {
+        Command::Get { url, input, dir, output, connections, limit, media } => {
             if media.is_some() && engine.media_tools().await.ytdlp.is_none() {
                 eprintln!("Installing yt-dlp, which video downloads need...");
                 let tool = engine.install_ytdlp().await?;
@@ -110,13 +118,42 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Some(dir) => dir,
                 None => dirs::download_dir().map_or_else(std::env::current_dir, Ok)?,
             };
-            let mut new = NewDownload::new(url, dir);
-            new.file_name = output;
-            new.connections = connections;
-            new.speed_limit = limit;
-            new.media = media;
-            let id = engine.add(new).await?;
-            follow(&engine, id).await?
+            let new = |url: String| {
+                let mut new = NewDownload::new(url, dir.clone());
+                new.file_name = output.clone();
+                new.connections = connections;
+                new.speed_limit = limit;
+                new.media = media;
+                new
+            };
+            match (url, input) {
+                (_, Some(input)) => {
+                    let links = read_links(&input)?;
+                    if links.is_empty() {
+                        bail!("no links found in {}", input.display());
+                    }
+                    let mut ids = Vec::new();
+                    let mut skipped = 0;
+                    for url in links {
+                        match engine.add(new(url.clone())).await {
+                            Ok(id) => {
+                                println!("[{id}] {url}");
+                                ids.push(id);
+                            }
+                            Err(e) => {
+                                eprintln!("Skipped {url}: {e}");
+                                skipped += 1;
+                            }
+                        }
+                    }
+                    follow_all(&engine, &ids, skipped).await?
+                }
+                (Some(url), None) => {
+                    let id = engine.add(new(url)).await?;
+                    follow(&engine, id).await?
+                }
+                (None, None) => unreachable!("clap requires a link or --input"),
+            }
         }
         Command::Resume { id } => {
             engine.start(DownloadId(id))?;
@@ -234,6 +271,107 @@ async fn follow(engine: &Engine, id: DownloadId) -> anyhow::Result<ExitCode> {
             ExitCode::SUCCESS
         }
     })
+}
+
+/// Follows several downloads until each has completed, failed or been paused, with one line for
+/// all of them while they run and a line for each as it ends.
+async fn follow_all(
+    engine: &Engine,
+    ids: &[DownloadId],
+    skipped: usize,
+) -> anyhow::Result<ExitCode> {
+    let mut events = engine.subscribe();
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut pausing = false;
+    let going = |id: DownloadId| -> anyhow::Result<bool> {
+        let status = engine.get(id)?.status;
+        Ok(engine.is_active(id) || matches!(status, Status::Queued | Status::Retrying))
+    };
+    let (mut saved, mut failed, mut paused) = (0, 0, 0);
+    let mut left: HashSet<DownloadId> = ids.iter().copied().collect();
+    let mut speeds: HashMap<DownloadId, u64> = HashMap::new();
+    while !left.is_empty() {
+        let mut ended = Vec::new();
+        for &id in &left {
+            if !going(id)? {
+                ended.push(id);
+            }
+        }
+        for id in ended {
+            left.remove(&id);
+            speeds.remove(&id);
+            let record = engine.wait(id).await?;
+            eprint!("\r\x1b[K");
+            match record.status {
+                Status::Completed => {
+                    saved += 1;
+                    println!("[{id}] Saved {} ({})", record.path().display(), bytes(record.downloaded()));
+                }
+                Status::Failed => {
+                    failed += 1;
+                    let error = record.error.as_deref().unwrap_or("unknown error");
+                    eprintln!("[{id}] Failed: {} ({error})", record.url);
+                }
+                _ => paused += 1,
+            }
+        }
+        if left.is_empty() {
+            break;
+        }
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(Event::Progress(p)) if left.contains(&p.id) => {
+                    speeds.insert(p.id, p.speed);
+                    eprint!(
+                        "\r{} of {} done  {} downloading  {}/s\x1b[K",
+                        ids.len() - left.len(),
+                        ids.len(),
+                        speeds.len(),
+                        bytes(speeds.values().sum())
+                    );
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+            result = &mut ctrl_c, if !pausing => {
+                result?;
+                pausing = true;
+                eprint!("\nPausing...");
+                for &id in &left {
+                    engine.pause(id);
+                }
+            }
+        }
+    }
+    eprintln!();
+    println!("{saved} saved, {failed} failed, {paused} paused, {skipped} skipped");
+    if failed + paused > 0 {
+        println!("Resume one with: blazer resume <id>");
+    }
+    Ok(if failed + skipped > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+}
+
+/// The http and https links in a text file, or in standard input for `-`, each once.
+fn read_links(path: &Path) -> anyhow::Result<Vec<String>> {
+    let text = if path == Path::new("-") {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        text
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    };
+    let mut seen = HashSet::new();
+    Ok(text
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
+        .filter_map(|word| {
+            let lower = word.to_ascii_lowercase();
+            let start = lower.find("https://").into_iter().chain(lower.find("http://")).min()?;
+            let link = word[start..].trim_end_matches(['.', ',', ';', ')', ']']);
+            (link.len() > "https://".len()).then(|| link.to_owned())
+        })
+        .filter(|link| seen.insert(link.clone()))
+        .collect())
 }
 
 fn print_progress(p: &Progress) {

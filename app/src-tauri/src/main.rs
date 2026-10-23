@@ -18,6 +18,7 @@ mod tray;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use futures_util::StreamExt;
 use blazer_core::{
     Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, MediaFormat, MediaInfo,
     MediaTools, NewDownload, Queue, QueueId, Settings, Status, Tool,
@@ -152,6 +153,88 @@ async fn add_download(
         tracing::warn!("saving the last folder used: {e:#}");
     }
     Ok(id)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportRequest {
+    urls: Vec<String>,
+    /// One folder for every link, or none to put each file in the folder for its type.
+    dir: Option<PathBuf>,
+    queue: QueueId,
+    start: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportFailure {
+    url: String,
+    error: String,
+}
+
+/// How many links of a list are checked with their servers at once.
+const IMPORT_AT_ONCE: usize = 6;
+
+/// Adds a list of links, a few at a time, and returns the ones that couldn't be added.
+#[tauri::command]
+async fn import_links(
+    engine: State<'_, Engine>,
+    prefs: State<'_, PrefsStore>,
+    request: ImportRequest,
+) -> CmdResult<Vec<ImportFailure>> {
+    let engine = engine.inner().clone();
+    let current = prefs.get();
+    let ImportRequest { urls, dir, queue, start } = request;
+    let failures = futures_util::stream::iter(urls)
+        .map(|url| {
+            let (engine, current, dir) = (&engine, &current, dir.clone());
+            async move {
+                let error = import_link(engine, current, &url, dir, queue, start).await.err()?;
+                Some(ImportFailure { url, error })
+            }
+        })
+        .buffered(IMPORT_AT_ONCE)
+        .filter_map(std::future::ready)
+        .collect()
+        .await;
+    if let Some(dir) = dir
+        && let Err(e) = prefs.update(|p| p.last_dir = Some(dir))
+    {
+        tracing::warn!("saving the last folder used: {e:#}");
+    }
+    Ok(failures)
+}
+
+async fn import_link(
+    engine: &Engine,
+    prefs: &Prefs,
+    url: &str,
+    dir: Option<PathBuf>,
+    queue: QueueId,
+    start: bool,
+) -> CmdResult<DownloadId> {
+    let url = url.trim();
+    let dir = match dir {
+        Some(dir) => dir,
+        None => {
+            // The name at the end of the link decides the folder. A link without one, such as
+            // download.php?id=7, asks the server.
+            let path = url.split(['?', '#']).next().unwrap_or(url);
+            let mut name = path.rsplit('/').next().unwrap_or("").to_owned();
+            if !name.contains('.')
+                && let Ok(info) = engine.inspect(url, &[]).await
+            {
+                name = info.file_name.unwrap_or(name);
+            }
+            prefs
+                .category_dir(Category::of(&name, false))
+                .ok_or("there's no Downloads folder to save in; pick a folder")?
+        }
+    };
+    let mut new = NewDownload::new(url, dir);
+    new.queue = Some(queue);
+    new.start = start;
+    engine.add(new).await.map_err(message)
 }
 
 // Commands that start downloads must be async: the engine spawns tasks on the tokio runtime,
@@ -636,6 +719,7 @@ fn main() {
             install_deno,
             free_space,
             add_download,
+            import_links,
             start_download,
             pause_download,
             restart_download,

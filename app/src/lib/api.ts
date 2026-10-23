@@ -214,6 +214,20 @@ export interface AddRequest {
   media?: MediaFormat | null;
 }
 
+export interface ImportRequest {
+  urls: string[];
+  /** One folder for every link, or null for the folder of each file's type. */
+  dir: string | null;
+  queue: number;
+  start: boolean;
+}
+
+/** A link of a list that couldn't be added, and why. */
+export interface ImportFailure {
+  url: string;
+  error: string;
+}
+
 /** A download handed over by the browser extension, waiting for the user to confirm it. */
 export interface Incoming {
   url: string;
@@ -242,6 +256,8 @@ export const api = {
   installDeno: () => invoke<Tool>("install_deno"),
   freeSpace: (dir: string) => invoke<number | null>("free_space", { dir }),
   add: (request: AddRequest) => invoke<number>("add_download", { request }),
+  /** Adds a list of links and returns the ones that couldn't be added. */
+  importLinks: (request: ImportRequest) => invoke<ImportFailure[]>("import_links", { request }),
   start: (id: number) => invoke<void>("start_download", { id }),
   pause: (id: number) => invoke<void>("pause_download", { id }),
   restart: (id: number) => invoke<void>("restart_download", { id }),

@@ -76,7 +76,7 @@ About, below Settings (also in the tray menu), shows the version, checks for upd
 
 The app keeps a log for each day, for a week, in the `logs` folder next to the download list. "Open log folder" in Settings shows it. Set `RUST_LOG=debug` for more detail.
 
-Shortcuts: Ctrl+N adds a download, Delete removes the selection, Enter opens a finished file or resumes a paused one, Ctrl+A selects all.
+Shortcuts: Ctrl+N adds a download, Ctrl+I imports a list of links (from pasted text or a .txt file), Ctrl+V outside a text field adds the links on the clipboard, Delete removes the selection, Enter opens a finished file or resumes a paused one, Ctrl+A selects all.
 
 ## Browser extension
 
@@ -104,6 +104,7 @@ If a download cannot reach the app, the browser downloads it after all and the t
 ```sh
 blazer get <URL> [-d DIR] [-o NAME] [-c CONNECTIONS] [-l LIMIT]   # Ctrl+C pauses
 blazer get <PAGE-URL> -m best|audio|720     # the video on a page, with yt-dlp
+blazer get -i links.txt [-d DIR]            # every link in a text file (- for stdin)
 blazer tools [--update]                     # show yt-dlp and ffmpeg; install or update yt-dlp
 blazer list
 blazer set-url <ID> <URL>                   # a fresh link for the same file; keeps progress

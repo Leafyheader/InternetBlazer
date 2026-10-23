@@ -154,6 +154,9 @@ pub(crate) struct Inner {
     installing: tokio::sync::Mutex<()>,
     /// Downloads whose files are being moved, which must not start until they are in place.
     held: Mutex<HashSet<DownloadId>>,
+    /// Held while a new download picks its file name and is saved, so downloads added at the
+    /// same time don't take the same name.
+    adding: Mutex<()>,
     /// Pages yt-dlp recently looked at, newest last.
     media_cache: Mutex<Vec<FoundMedia>>,
 }
@@ -369,6 +372,7 @@ impl Engine {
                 settings: Mutex::new(settings),
                 installing: tokio::sync::Mutex::default(),
                 held: Mutex::default(),
+                adding: Mutex::default(),
                 media_cache: Mutex::default(),
             }),
         })
@@ -561,6 +565,7 @@ impl Engine {
             }
             (None, None) => filename::sanitize(info.file_name.as_deref().unwrap_or("download")),
         };
+        let adding = self.inner.adding.lock();
         let in_progress: Vec<PathBuf> = self
             .list()?
             .into_iter()
@@ -608,6 +613,7 @@ impl Engine {
             last_try_at: None,
         };
         self.inner.store.save(&record)?;
+        drop(adding);
         self.inner.emit(Event::Added(record));
         if new.start {
             self.inner.dispatch();

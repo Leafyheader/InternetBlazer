@@ -2206,6 +2206,7 @@ dependencies = [
  "blazer-host",
  "dirs 6.0.0",
  "file_icon_provider",
+ "futures-util",
  "parking_lot",
  "png",
  "serde",

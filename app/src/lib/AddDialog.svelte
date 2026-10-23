@@ -14,16 +14,19 @@
   let {
     onclose,
     queue: initialQueue = MAIN_QUEUE,
+    url: initialUrl = "",
     prefill,
   }: {
     onclose: () => void;
     queue?: number;
+    /** A link pasted into the window. */
+    url?: string;
     /** A download from the browser. */
     prefill?: Incoming;
   } = $props();
 
   // svelte-ignore state_referenced_locally
-  let url = $state(prefill?.url ?? "");
+  let url = $state(prefill?.url ?? initialUrl);
   let dir = $state("");
   /** Set once the user picks a folder, which then no longer follows the file's type. */
   let touchedDir = false;

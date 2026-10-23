@@ -16,6 +16,7 @@ blazer-core.workspace = true
 blazer-host.workspace = true
 dirs.workspace = true
 file_icon_provider.workspace = true
+futures-util.workspace = true
 parking_lot.workspace = true
 png.workspace = true
 serde.workspace = true
