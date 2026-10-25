@@ -10,8 +10,10 @@
 //! limited in speed, each and all together.
 //!
 //! Videos and sounds on web pages are downloaded by yt-dlp instead, which the engine runs, can
-//! install, and schedules like any other download.
+//! install, and schedules like any other download. An HLS or DASH playlist that a video player
+//! fetched is the exception: the engine downloads its pieces itself, as IDM does.
 
+mod checksum;
 mod child;
 mod download;
 mod engine;
@@ -26,6 +28,7 @@ mod queue;
 mod segment;
 mod sniff;
 mod store;
+mod stream;
 mod tools;
 mod types;
 
@@ -35,9 +38,10 @@ pub use limit::MIN_SPEED_LIMIT;
 pub use queue::{ALL_DAYS, Queue, Schedule};
 pub use segment::Segment;
 pub use store::{RedbStore, Store};
+pub use checksum::parse_sha256;
 pub use types::{
-    DownloadId, DownloadRecord, Event, LinkInfo, MediaChoice, MediaFormat, MediaInfo, MediaTools,
-    Progress, QueueId, Retry, Settings, Status, Tool,
+    CheckState, Checksum, DownloadId, DownloadRecord, Event, LinkInfo, MediaChoice, MediaFormat, MediaInfo, MediaTools,
+    Progress, QueueId, Retry, Settings, Status, Tool, TrackProgress,
 };
 
 /// Bytes free for this user on the disk that would hold `path`, which need not exist yet.

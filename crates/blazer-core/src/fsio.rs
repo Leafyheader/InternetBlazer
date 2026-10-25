@@ -75,6 +75,27 @@ pub(crate) fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Resu
     Ok(())
 }
 
+#[cfg(unix)]
+pub(crate) fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+pub(crate) fn read_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset)? {
+            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+            n => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Bytes free for this user on the disk that holds `path`, which need not exist yet.
 pub(crate) fn available_space(path: &Path) -> io::Result<u64> {
     let existing = path.ancestors().find(|p| p.exists()).unwrap_or(path);

@@ -14,6 +14,23 @@ export interface Retry {
   at: number;
 }
 
+/** A SHA-256 the downloaded file should have. */
+export interface Checksum {
+  /** In lowercase hex. */
+  expected: string;
+  state: CheckState;
+}
+
+export type CheckState =
+  /** Not checked yet: the download hasn't finished, or the check was cut off. */
+  | { type: "waiting" }
+  | { type: "checking" }
+  | { type: "matched" }
+  /** The file is damaged, or isn't the one the hash belongs to. */
+  | { type: "mismatched"; actual: string }
+  /** The file couldn't be read. */
+  | { type: "failed"; error: string };
+
 export interface Segment {
   start: number;
   end: number;
@@ -36,6 +53,8 @@ export interface DownloadRecord {
   speedLimit: number | null;
   /** Set for a video on a web page, which yt-dlp downloads. */
   media: MediaFormat | null;
+  /** The video is an HLS or DASH playlist, whose pieces the engine downloads instead of yt-dlp. */
+  stream: boolean;
   segments: Segment[];
   status: Status;
   error: string | null;
@@ -47,6 +66,8 @@ export interface DownloadRecord {
   completedAt: number | null;
   /** When it last started downloading. Null if never, or if added before this was kept. */
   lastTryAt: number | null;
+  /** The SHA-256 the file should have, checked once it finishes. */
+  checksum: Checksum | null;
 }
 
 export interface Progress {
@@ -204,6 +225,7 @@ export type EngineEvent =
   | { type: "statusChanged"; id: number; status: Status; error: string | null }
   | ({ type: "updated" } & DownloadRecord)
   | { type: "removed"; id: number }
+  | { type: "checksumChanged"; id: number; checksum: Checksum | null }
   | { type: "queuesChanged" }
   | ({ type: "settingsChanged" } & Settings);
 
@@ -218,6 +240,8 @@ export interface AddRequest {
   headers?: [string, string][];
   /** Download the video on the page with yt-dlp. */
   media?: MediaFormat | null;
+  /** Text holding the SHA-256 the file should have. */
+  sha256?: string | null;
 }
 
 export interface ImportRequest {
@@ -273,6 +297,11 @@ export const api = {
   setQueue: (id: number, queue: number) => invoke<void>("set_download_queue", { id, queue }),
   setDownloadSpeedLimit: (id: number, limit: number | null) =>
     invoke<void>("set_download_speed_limit", { id, limit }),
+  /** Sets the SHA-256 the file should have, from text holding one, or forgets it with null. */
+  setSha256: (id: number, sha256: string | null) =>
+    invoke<void>("set_download_sha256", { id, sha256 }),
+  /** Checks the finished file against its SHA-256 again. */
+  checkSha256: (id: number) => invoke<void>("check_download_sha256", { id }),
   queues: () => invoke<Queue[]>("list_queues"),
   addQueue: (queue: Queue) => invoke<Queue>("add_queue", { queue }),
   updateQueue: (queue: Queue) => invoke<void>("update_queue", { queue }),

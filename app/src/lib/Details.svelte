@@ -1,5 +1,6 @@
 <script lang="ts">
   import { clock } from "./clock.svelte";
+  import { api } from "./api";
   import { downloads, retryIn, STATUS_LABELS, type Item } from "./downloads.svelte";
   import { bytes, date, duration, quality } from "./format";
 
@@ -29,7 +30,8 @@
     if (downloads.speedLimit !== null && downloads.totalSpeed >= downloads.speedLimit * AT_LIMIT) {
       return others ? `held to the overall speed limit, shared with ${downloadsText(others)}` : "held to the overall speed limit";
     }
-    if (item.media) return "yt-dlp downloads it, at the pace the site allows";
+    if (item.media && !item.stream) return "yt-dlp downloads it, at the pace the site allows";
+    if (item.stream) return item.planned === 1 ? "set to use one connection" : null;
     if (!item.resumable) return "the server sends this file over one connection only";
     if (item.total === null) return "the server didn't say the size, so it comes over one connection";
     if (item.planned === 1) return "set to use one connection";
@@ -40,6 +42,17 @@
     if (others) return `sharing your internet with ${downloadsText(others)}`;
     return `using all ${item.planned} connections; the server and your network set the pace`;
   });
+
+  let checkError = $state("");
+
+  async function check() {
+    checkError = "";
+    try {
+      await api.checkSha256(item.id);
+    } catch (err) {
+      checkError = String(err);
+    }
+  }
 
   let path = $derived.by(() => {
     const sep = item.dir.includes("\\") ? "\\" : "/";
@@ -96,11 +109,13 @@
     {/if}
     {#if item.media}
       <dt>Video</dt>
-      <dd>{quality(item.media)} · downloaded by yt-dlp</dd>
+      <dd>{quality(item.media)} · {item.stream ? "pieces of its playlist, downloaded here" : "downloaded by yt-dlp"}</dd>
     {/if}
     <dt>Resume</dt>
     <dd>
-      {#if item.media}
+      {#if item.stream}
+        Supported · pausing keeps the pieces downloaded
+      {:else if item.media}
         Supported · yt-dlp carries on where it stopped
       {:else if item.resumable}
         Supported · pausing keeps what's downloaded
@@ -108,6 +123,36 @@
         <span class="warn">Not supported</span> · pausing or a lost connection starts over
       {/if}
     </dd>
+    {#if item.checksum}
+      {@const state = item.checksum.state}
+      {@const done = item.status === "completed"}
+      <dt>SHA-256</dt>
+      <dd title={item.checksum.expected}>
+        {#if state.type === "checking"}
+          Checking the file…
+        {:else if state.type === "matched"}
+          <span class="ok">Matches</span> · the file is the one expected
+        {:else if state.type === "mismatched"}
+          <span class="error-text">Doesn't match</span> · the file is damaged, or isn't the one the hash
+          belongs to
+        {:else if state.type === "failed"}
+          <span class="warn">Couldn't check</span> · {state.error}
+        {:else if done}
+          Not checked yet
+        {:else}
+          Checked when the download finishes
+        {/if}
+        {#if done && state.type !== "checking"}
+          · <button class="link" onclick={check}>{state.type === "waiting" ? "Check" : "Check again"}</button>
+        {/if}
+        {#if state.type === "mismatched"}
+          <br /><span class="muted">This file's:</span> <span class="selectable hash">{state.actual}</span>
+        {/if}
+        {#if checkError}
+          <br /><span class="error-text">{checkError}</span>
+        {/if}
+      </dd>
+    {/if}
     <dt>Queue</dt>
     <dd>{downloads.queueName(item.queue)}</dd>
     <dt>Speed limit</dt>

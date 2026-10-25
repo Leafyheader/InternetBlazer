@@ -707,6 +707,10 @@ When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
               {:else if item.status === "retrying"}
                 {@const wait = retryIn(item, clock.now)}
                 {wait ? `Retrying in ${duration(wait)}` : "Retrying…"}
+              {:else if item.status === "completed" && item.checksum?.state.type === "checking"}
+                Checking SHA-256…
+              {:else if item.status === "completed" && item.checksum?.state.type === "mismatched"}
+                <span class="error-text">SHA-256 mismatch</span>
               {:else if (item.status === "paused" || item.status === "queued") && pct}
                 {STATUS_LABELS[item.status]} · {pct.toFixed(0)}%
               {:else}

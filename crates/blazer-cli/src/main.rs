@@ -8,7 +8,8 @@ use std::{
 
 use anyhow::{Context, bail};
 use blazer_core::{
-    Config, DownloadId, DownloadRecord, Engine, Event, MediaFormat, NewDownload, Progress, Status,
+    CheckState, Config, DownloadId, DownloadRecord, Engine, Event, MediaFormat, NewDownload,
+    Progress, Status,
 };
 use clap::{Parser, Subcommand};
 use tokio::sync::broadcast::error::RecvError;
@@ -50,6 +51,9 @@ enum Command {
         /// `audio` for the sound alone.
         #[arg(short = 'm', long, value_parser = parse_media)]
         media: Option<MediaFormat>,
+        /// The SHA-256 the file should have, checked once it finishes. Fails if it differs.
+        #[arg(long, value_name = "HASH", conflicts_with = "input")]
+        sha256: Option<String>,
     },
     /// Resume a paused or failed download.
     Resume { id: u64 },
@@ -108,7 +112,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         .with_context(|| format!("opening {}", db.display()))?;
 
     let code = match cli.command {
-        Command::Get { url, input, dir, output, connections, limit, media } => {
+        Command::Get { url, input, dir, output, connections, limit, media, sha256 } => {
             if media.is_some() && engine.media_tools().await.ytdlp.is_none() {
                 eprintln!("Installing yt-dlp, which video downloads need...");
                 let tool = engine.install_ytdlp().await?;
@@ -124,6 +128,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 new.connections = connections;
                 new.speed_limit = limit;
                 new.media = media;
+                new.sha256 = sha256.clone();
                 new
             };
             match (url, input) {
@@ -259,7 +264,36 @@ async fn follow(engine: &Engine, id: DownloadId) -> anyhow::Result<ExitCode> {
     Ok(match record.status {
         Status::Completed => {
             println!("Saved {} ({})", record.path().display(), bytes(record.downloaded()));
-            ExitCode::SUCCESS
+            if record.checksum.is_none() {
+                return Ok(ExitCode::SUCCESS);
+            }
+            eprint!("Checking SHA-256...");
+            let state = loop {
+                let state = engine.get(id)?.checksum.map(|c| c.state);
+                if state != Some(CheckState::Checking) {
+                    break state;
+                }
+                if let Err(RecvError::Closed) = events.recv().await {
+                    break state;
+                }
+            };
+            eprint!("\r\x1b[K");
+            match state {
+                Some(CheckState::Matched) => {
+                    println!("SHA-256 matches");
+                    ExitCode::SUCCESS
+                }
+                Some(CheckState::Mismatched { actual }) => {
+                    eprintln!("SHA-256 doesn't match: the file's is {actual}");
+                    eprintln!("It's damaged, or not the file the hash belongs to.");
+                    ExitCode::FAILURE
+                }
+                Some(CheckState::Failed { error }) => {
+                    eprintln!("Couldn't check the SHA-256: {error}");
+                    ExitCode::FAILURE
+                }
+                Some(CheckState::Waiting | CheckState::Checking) | None => ExitCode::SUCCESS,
+            }
         }
         Status::Failed => {
             eprintln!("Failed: {}", record.error.as_deref().unwrap_or("unknown error"));

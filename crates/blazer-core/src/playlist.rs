@@ -1,6 +1,6 @@
 //! Reads the HLS and DASH playlists that video players fetch, to list a stream's qualities in a
-//! moment, where asking yt-dlp takes seconds. yt-dlp still downloads the stream, given the
-//! playlist and the height picked, which it matches to the same qualities.
+//! moment, where asking yt-dlp takes seconds. [`tracks`] then lists the pieces of the quality
+//! picked, which the engine downloads itself (see [`crate::stream`]).
 //!
 //! An HLS master playlist lists one variant per quality, each with its own playlist of pieces;
 //! a DASH manifest lists the picture and the sound separately, which ffmpeg joins.
@@ -13,6 +13,7 @@ use url::Url;
 use crate::{
     error::{Error, Result},
     probe,
+    stream::{Container, Key, Piece, Track, TrackKind},
     types::{MediaChoice, MediaFormat, MediaInfo},
 };
 
@@ -70,6 +71,62 @@ pub(crate) async fn inspect(
     } else {
         Err(Error::NotPlaylist)
     }
+}
+
+/// What to download for `format` from the playlist at `url`: the picture, with its sound in it
+/// or as a second track, or the sound alone. Fails with [`Error::NotPlaylist`] for what is left
+/// to yt-dlp, such as a live stream.
+pub(crate) async fn tracks(
+    client: &Client,
+    url: &Url,
+    headers: &[(String, String)],
+    format: MediaFormat,
+) -> Result<Vec<Track>> {
+    let text = fetch(client, url, headers).await?;
+    if !is_hls(&text) {
+        if !is_dash(&text) {
+            return Err(Error::NotPlaylist);
+        }
+        let manifest = dash::parse(&text)?;
+        if manifest.unsupported {
+            return Err(Error::NotPlaylist);
+        }
+        let mut tracks = Vec::new();
+        for (rep, kind) in dash::pick(&manifest, format) {
+            tracks.push(dash::track(client, headers, url, &manifest, rep, kind).await?);
+        }
+        // Only a picture or only a sound: nothing that matches what was picked.
+        if tracks.is_empty()
+            || (format == MediaFormat::Audio) != (tracks[0].kind == TrackKind::Audio)
+        {
+            return Err(Error::NotPlaylist);
+        }
+        return Ok(tracks);
+    }
+    let master = hls::parse(&text);
+    if master.variants.is_empty() {
+        // A playlist of pieces: one quality, with the sound in it.
+        return Ok(vec![hls::track(url, &text, TrackKind::Video, None)?]);
+    }
+    hls::check_keys(&text)?;
+    let variant = hls::pick(&master, format);
+    let mut tracks = Vec::new();
+    if let (MediaFormat::Video { .. }, Some(variant)) = (format, variant) {
+        let variant_url = url.join(&variant.uri).map_err(|e| Error::Invalid(e.to_string()))?;
+        let text = fetch(client, &variant_url, headers).await?;
+        tracks.push(hls::track(&variant_url, &text, TrackKind::Video, variant.bandwidth)?);
+    }
+    match hls::sound_for(&master, variant, format) {
+        Some(sound) => {
+            let sound_url = url.join(&sound.uri).map_err(|e| Error::Invalid(e.to_string()))?;
+            let text = fetch(client, &sound_url, headers).await?;
+            tracks.push(hls::track(&sound_url, &text, TrackKind::Audio, None)?);
+        }
+        // The choices offer the sound alone only when it comes apart.
+        None if format == MediaFormat::Audio => return Err(Error::NotPlaylist),
+        None => {}
+    }
+    Ok(tracks)
 }
 
 async fn fetch(client: &Client, url: &Url, headers: &[(String, String)]) -> Result<String> {
@@ -146,6 +203,8 @@ mod hls {
         pub variants: Vec<Variant>,
         /// The sound comes as its own stream, which must be joined to the picture.
         pub separate_audio: bool,
+        /// The sound streams of their own, in the order listed.
+        pub audio: Vec<Rendition>,
     }
 
     #[derive(Debug)]
@@ -154,6 +213,15 @@ mod hls {
         pub bandwidth: Option<u64>,
         pub height: Option<u32>,
         pub fps: Option<f64>,
+        /// The group of sound streams that goes with it, if its sound is not in its own pieces.
+        pub audio: Option<String>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Rendition {
+        pub group: String,
+        pub uri: String,
+        pub default: bool,
     }
 
     pub(super) fn parse(text: &str) -> Master {
@@ -166,8 +234,13 @@ mod hls {
                 let attrs = attributes(attrs);
                 let is_audio = get(&attrs, "TYPE") == Some("AUDIO");
                 // Sound without a URI is inside the variants' own pieces.
-                if is_audio && get(&attrs, "URI").is_some() {
+                if is_audio && let Some(uri) = get(&attrs, "URI") {
                     master.separate_audio = true;
+                    master.audio.push(Rendition {
+                        group: get(&attrs, "GROUP-ID").unwrap_or_default().to_string(),
+                        uri: uri.to_string(),
+                        default: get(&attrs, "DEFAULT") == Some("YES"),
+                    });
                 }
             } else if !line.starts_with('#')
                 && let Some(attrs) = pending.take()
@@ -179,11 +252,158 @@ mod hls {
                     .and_then(|r| r.split_once(['x', 'X']))
                     .and_then(|(_, h)| h.parse().ok());
                 let fps = get(&attrs, "FRAME-RATE").and_then(|f| f.parse().ok());
-                master.variants.push(Variant { uri: line.to_string(), bandwidth, height, fps });
+                let audio = get(&attrs, "AUDIO").map(str::to_string);
+                master.variants.push(Variant {
+                    uri: line.to_string(),
+                    bandwidth,
+                    height,
+                    fps,
+                    audio,
+                });
             }
         }
         master.variants.sort_by_key(|v| Reverse((v.height, v.bandwidth)));
         master
+    }
+
+    /// The variant for `format`: the best up to the height asked for, as the choices offered
+    /// it, or the smallest when every one is taller.
+    pub(super) fn pick(master: &Master, format: MediaFormat) -> Option<&Variant> {
+        match format {
+            MediaFormat::Video { max_height: Some(max) } => master
+                .variants
+                .iter()
+                .find(|v| v.height.is_none_or(|h| h <= max))
+                .or(master.variants.last()),
+            _ => master.variants.first(),
+        }
+    }
+
+    /// The sound stream to go with `variant`: the group's default, or its first. For the sound
+    /// alone, any of them will do when the variant names no group.
+    pub(super) fn sound_for<'a>(
+        master: &'a Master,
+        variant: Option<&Variant>,
+        format: MediaFormat,
+    ) -> Option<&'a Rendition> {
+        let group = variant.and_then(|v| v.audio.as_deref());
+        let candidates: Vec<&Rendition> = match group {
+            Some(group) => master.audio.iter().filter(|r| r.group == group).collect(),
+            None if format == MediaFormat::Audio => master.audio.iter().collect(),
+            None => Vec::new(),
+        };
+        candidates.iter().find(|r| r.default).or(candidates.first()).copied()
+    }
+
+    /// The pieces of the media playlist `text` at `url`. Fails with [`Error::NotPlaylist`] for
+    /// a live stream, which has no end to download to.
+    pub(super) fn track(
+        url: &Url,
+        text: &str,
+        kind: TrackKind,
+        bandwidth: Option<u64>,
+    ) -> Result<Track> {
+        check_keys(text)?;
+        let join = |uri: &str| url.join(uri).map_err(|e| Error::Invalid(e.to_string()));
+        let mut pieces = Vec::new();
+        let mut sequence: u64 = 0;
+        let mut key: Option<(Url, Option<[u8; 16]>)> = None;
+        let mut seconds = 0.0;
+        let mut range: Option<(u64, Option<u64>)> = None;
+        // Where the last sub-range of each resource ended, which a range without an offset
+        // starts from.
+        let mut ends: Vec<(Url, u64)> = Vec::new();
+        let mut map: Option<(Url, Option<(u64, u64)>)> = None;
+        let mut fmp4 = false;
+        let mut ended = false;
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if let Some(n) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
+                sequence = n.trim().parse().unwrap_or(0);
+            } else if let Some(attrs) = line.strip_prefix("#EXT-X-KEY:") {
+                let attrs = attributes(attrs);
+                key = match get(&attrs, "METHOD") {
+                    Some("AES-128") => {
+                        let uri = get(&attrs, "URI").ok_or_else(|| {
+                            Error::Invalid("the stream's key has no address".into())
+                        })?;
+                        Some((join(uri)?, get(&attrs, "IV").map(parse_iv).transpose()?))
+                    }
+                    _ => None,
+                };
+            } else if let Some(attrs) = line.strip_prefix("#EXT-X-MAP:") {
+                let attrs = attributes(attrs);
+                let Some(uri) = get(&attrs, "URI") else { continue };
+                let range = get(&attrs, "BYTERANGE")
+                    .and_then(parse_range)
+                    .map(|(len, start)| (start.unwrap_or(0), len));
+                let found = (join(uri)?, range);
+                fmp4 = true;
+                // Written once, and again only where the stream changes it.
+                if map.as_ref() != Some(&found) {
+                    pieces.push(Piece {
+                        url: found.0.clone(),
+                        range: found.1,
+                        key: None,
+                        seconds: 0.0,
+                    });
+                    map = Some(found);
+                }
+            } else if let Some(info) = line.strip_prefix("#EXTINF:") {
+                seconds = info.split(',').next().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
+            } else if let Some(r) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+                range = parse_range(r);
+            } else if line == "#EXT-X-ENDLIST" || line == "#EXT-X-PLAYLIST-TYPE:VOD" {
+                ended = true;
+            } else if !line.starts_with('#') {
+                let piece_url = join(line)?;
+                let range = range.take().map(|(len, start)| {
+                    let start = start.unwrap_or_else(|| {
+                        ends.iter().find(|(u, _)| *u == piece_url).map_or(0, |(_, end)| *end)
+                    });
+                    ends.retain(|(u, _)| *u != piece_url);
+                    ends.push((piece_url.clone(), start + len));
+                    (start, len)
+                });
+                let key = key.as_ref().map(|(url, iv)| Key {
+                    url: url.clone(),
+                    // Without its own IV, a piece uses its sequence number.
+                    iv: iv.unwrap_or_else(|| u128::from(sequence).to_be_bytes()),
+                });
+                pieces.push(Piece { url: piece_url, range, key, seconds });
+                sequence += 1;
+                seconds = 0.0;
+            }
+        }
+        if !ended || pieces.iter().all(|p| p.seconds == 0.0) {
+            return Err(Error::NotPlaylist);
+        }
+        let container = if fmp4 {
+            Container::Mp4
+        } else {
+            match pieces.first().map(|p| p.url.path().to_ascii_lowercase()) {
+                Some(path) if path.ends_with(".aac") => Container::Aac,
+                Some(path) if path.ends_with(".mp4") || path.ends_with(".m4s") => Container::Mp4,
+                _ => Container::Ts,
+            }
+        };
+        Ok(Track { kind, container, pieces, bandwidth })
+    }
+
+    /// `length[@offset]`, as `EXT-X-BYTERANGE` and the `BYTERANGE` attribute write it.
+    fn parse_range(text: &str) -> Option<(u64, Option<u64>)> {
+        let text = text.trim();
+        match text.split_once('@') {
+            Some((len, start)) => Some((len.parse().ok()?, Some(start.parse().ok()?))),
+            None => Some((text.parse().ok()?, None)),
+        }
+    }
+
+    /// `0x` and 32 hex digits.
+    fn parse_iv(text: &str) -> Result<[u8; 16]> {
+        let hex = text.trim_start_matches("0x").trim_start_matches("0X");
+        let value = u128::from_str_radix(hex, 16)
+            .map_err(|_| Error::Invalid(format!("the stream's key has a bad IV: {text}")))?;
+        Ok(value.to_be_bytes())
     }
 
     /// Fails for keys other than plain AES-128, which DRM systems use.
@@ -300,165 +520,7 @@ mod hls {
     }
 }
 
-mod dash {
-    use super::*;
-
-    #[derive(Debug, Default)]
-    pub(super) struct Manifest {
-        pub duration: Option<f64>,
-        pub videos: Vec<Representation>,
-        pub audios: Vec<Representation>,
-    }
-
-    #[derive(Debug)]
-    pub(super) struct Representation {
-        pub bandwidth: Option<u64>,
-        pub height: Option<u32>,
-        pub fps: Option<f64>,
-        pub mp4: bool,
-    }
-
-    /// Reads what the qualities need from the manifest's XML, without a full XML parser.
-    pub(super) fn parse(text: &str) -> Result<Manifest> {
-        if text.contains("<ContentProtection") || text.contains(":ContentProtection") {
-            return Err(drm());
-        }
-        let mut manifest = Manifest {
-            duration: tag(text, "MPD")
-                .and_then(|t| attr(t, "mediaPresentationDuration"))
-                .and_then(iso_duration),
-            ..Default::default()
-        };
-        for set in text.split("<AdaptationSet").skip(1) {
-            let set = set.split("</AdaptationSet>").next().unwrap_or(set);
-            let set_tag = set.split('>').next().unwrap_or_default();
-            let set_kind = kind(set_tag);
-            for rep in set.split("<Representation").skip(1) {
-                let rep_tag = rep.split('>').next().unwrap_or_default();
-                let mime = attr(rep_tag, "mimeType").or_else(|| attr(set_tag, "mimeType"));
-                let (video, audio) = match kind(rep_tag).or(set_kind) {
-                    Some(k) => (k == "video", k == "audio"),
-                    None => (false, false),
-                };
-                let found = Representation {
-                    bandwidth: attr(rep_tag, "bandwidth").and_then(|b| b.parse().ok()),
-                    height: attr(rep_tag, "height")
-                        .or_else(|| attr(set_tag, "height"))
-                        .and_then(|h| h.parse().ok()),
-                    fps: attr(rep_tag, "frameRate")
-                        .or_else(|| attr(set_tag, "frameRate"))
-                        .and_then(frame_rate),
-                    mp4: mime.is_none_or(|m| m.contains("mp4")),
-                };
-                if video {
-                    manifest.videos.push(found);
-                } else if audio {
-                    manifest.audios.push(found);
-                }
-            }
-        }
-        manifest.videos.sort_by_key(|v| Reverse((v.height, v.mp4, v.bandwidth)));
-        manifest.audios.sort_by_key(|a| Reverse((a.mp4, a.bandwidth)));
-        Ok(manifest)
-    }
-
-    pub(super) fn choices(manifest: &Manifest, ffmpeg: bool) -> Vec<MediaChoice> {
-        let sound = manifest.audios.first();
-        let mut choices = Vec::new();
-        // DASH always keeps picture and sound apart, so a video needs ffmpeg.
-        if ffmpeg {
-            let mut heights = Vec::new();
-            for v in &manifest.videos {
-                let Some(height) = v.height else { continue };
-                if heights.contains(&height) {
-                    continue;
-                }
-                heights.push(height);
-                let bandwidth =
-                    v.bandwidth.map(|b| b + sound.and_then(|s| s.bandwidth).unwrap_or(0));
-                choices.push(MediaChoice {
-                    label: label(height, v.fps),
-                    format: MediaFormat::Video { max_height: Some(height) },
-                    ext: if v.mp4 && sound.is_none_or(|s| s.mp4) { "mp4" } else { "mkv" }.into(),
-                    size: estimate(bandwidth, manifest.duration),
-                });
-            }
-        }
-        if let Some(sound) = sound {
-            choices.push(MediaChoice {
-                label: "Audio only".into(),
-                format: MediaFormat::Audio,
-                ext: if sound.mp4 { "m4a" } else { "webm" }.into(),
-                size: estimate(sound.bandwidth, manifest.duration),
-            });
-        }
-        choices
-    }
-
-    fn kind(tag: &str) -> Option<&'static str> {
-        let text = attr(tag, "contentType").or_else(|| attr(tag, "mimeType"))?;
-        if text.starts_with("video") {
-            Some("video")
-        } else if text.starts_with("audio") {
-            Some("audio")
-        } else {
-            None
-        }
-    }
-
-    /// The text of the first `<name ...>` tag.
-    fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
-        let start = text.find(&format!("<{name}"))?;
-        text[start..].split('>').next()
-    }
-
-    /// The value of ` name="value"` in a tag.
-    fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-        let mut search = tag;
-        loop {
-            let at = search.find(name)?;
-            let before = search[..at].chars().next_back();
-            let after = &search[at + name.len()..];
-            if before.is_some_and(char::is_whitespace)
-                && let Some(value) = after.strip_prefix("=\"").or_else(|| after.strip_prefix("='"))
-            {
-                return value.split(['"', '\'']).next();
-            }
-            search = after;
-        }
-    }
-
-    /// `30000/1001` or `25`.
-    fn frame_rate(text: &str) -> Option<f64> {
-        match text.split_once('/') {
-            Some((a, b)) => Some(a.parse::<f64>().ok()? / b.parse::<f64>().ok()?),
-            None => text.parse().ok(),
-        }
-    }
-
-    /// `PT1H2M3.5S`, as DASH writes lengths.
-    pub(super) fn iso_duration(text: &str) -> Option<f64> {
-        let time = text.strip_prefix("PT").or_else(|| text.split_once('T').map(|(_, t)| t))?;
-        let mut total = 0.0;
-        let mut number = String::new();
-        for c in time.chars() {
-            match c {
-                'H' | 'M' | 'S' => {
-                    let value: f64 = number.parse().ok()?;
-                    total += value
-                        * match c {
-                            'H' => 3600.0,
-                            'M' => 60.0,
-                            _ => 1.0,
-                        };
-                    number.clear();
-                }
-                _ => number.push(c),
-            }
-        }
-        (total > 0.0).then_some(total)
-    }
-}
+mod dash;
 
 #[cfg(test)]
 mod tests {
@@ -520,6 +582,95 @@ mod tests {
         assert!(hls::check_keys("#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://x\"").is_err());
         let widevine = "#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,KEYFORMAT=\"urn:uuid:edef8ba9\"";
         assert!(hls::check_keys(widevine).is_err());
+    }
+
+    #[test]
+    fn hls_pieces_carry_keys_ranges_and_the_init_piece() {
+        let url = Url::parse("https://cdn.example/v/720/index.m3u8?t=1").unwrap();
+        let text = "#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:7
+#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"800@0\"
+#EXT-X-KEY:METHOD=AES-128,URI=\"/keys/k1\"
+#EXTINF:4.0,
+#EXT-X-BYTERANGE:1000@800
+all.mp4
+#EXTINF:4.0,
+#EXT-X-BYTERANGE:1200
+all.mp4
+#EXT-X-KEY:METHOD=AES-128,URI=\"k2\",IV=0x000102030405060708090A0B0C0D0E0F
+#EXTINF:2.5,
+b.m4s
+#EXT-X-KEY:METHOD=NONE
+#EXTINF:1,
+c.m4s
+#EXT-X-ENDLIST
+";
+        let track = hls::track(&url, text, TrackKind::Video, Some(1)).unwrap();
+        assert_eq!(track.container, Container::Mp4);
+        let p = &track.pieces;
+        assert_eq!(p.len(), 5);
+        assert_eq!(
+            (p[0].url.as_str(), p[0].range, p[0].seconds),
+            ("https://cdn.example/v/720/init.mp4", Some((0, 800)), 0.0)
+        );
+        assert_eq!(p[1].range, Some((800, 1000)));
+        // Without an offset, a range follows the last one of the same file.
+        assert_eq!(p[2].range, Some((1800, 1200)));
+        let key = p[1].key.as_ref().unwrap();
+        assert_eq!(key.url.as_str(), "https://cdn.example/keys/k1");
+        // Without an IV, the media sequence number is one.
+        assert_eq!(key.iv, 7u128.to_be_bytes());
+        assert_eq!(p[2].key.as_ref().unwrap().iv, 8u128.to_be_bytes());
+        assert_eq!(
+            p[3].key.as_ref().unwrap().iv,
+            0x0001_0203_0405_0607_0809_0A0B_0C0D_0E0Fu128.to_be_bytes()
+        );
+        assert!(p[4].key.is_none());
+    }
+
+    #[test]
+    fn hls_live_streams_are_left_to_ytdlp() {
+        let url = Url::parse("https://cdn.example/live.m3u8").unwrap();
+        let live = "#EXTM3U\n#EXTINF:6,\na.ts\n#EXTINF:6,\nb.ts\n";
+        assert!(matches!(hls::track(&url, live, TrackKind::Video, None), Err(Error::NotPlaylist)));
+        let vod = format!("{live}#EXT-X-ENDLIST\n");
+        let track = hls::track(&url, &vod, TrackKind::Video, None).unwrap();
+        assert_eq!(track.container, Container::Ts);
+        assert_eq!(track.pieces[1].url.as_str(), "https://cdn.example/b.ts");
+    }
+
+    #[test]
+    fn hls_picks_the_height_and_its_sound() {
+        let text = "#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"lo\",NAME=\"en\",URI=\"lo.m3u8\"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"hi\",NAME=\"de\",URI=\"hi-de.m3u8\"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"hi\",NAME=\"en\",DEFAULT=YES,URI=\"hi-en.m3u8\"
+#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"lo\"
+360.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,AUDIO=\"hi\"
+1080.m3u8
+";
+        let master = hls::parse(text);
+        let pick = |h| hls::pick(&master, MediaFormat::Video { max_height: h }).unwrap();
+        assert_eq!(pick(None).uri, "1080.m3u8");
+        assert_eq!(pick(Some(720)).uri, "360.m3u8");
+        // Taller than any asked for: the smallest there is.
+        assert_eq!(pick(Some(240)).uri, "360.m3u8");
+        let sound = |h| {
+            let format = MediaFormat::Video { max_height: h };
+            hls::sound_for(&master, hls::pick(&master, format), format).map(|r| r.uri.as_str())
+        };
+        assert_eq!(sound(None), Some("hi-en.m3u8"));
+        assert_eq!(sound(Some(360)), Some("lo.m3u8"));
+        // A variant with its sound inside needs no second track.
+        assert!(
+            hls::sound_for(
+                &hls::parse(MASTER),
+                hls::parse(MASTER).variants.first(),
+                MediaFormat::Video { max_height: None }
+            )
+            .is_none()
+        );
     }
 
     const MPD: &str = r#"<?xml version="1.0"?>

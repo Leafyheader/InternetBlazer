@@ -176,6 +176,11 @@ class Downloads {
             item.speedLimit = event.speedLimit;
             break;
           }
+          case "checksumChanged": {
+            const item = this.items[event.id];
+            if (item) item.checksum = event.checksum;
+            break;
+          }
           case "removed":
             delete this.items[event.id];
             onRemoved(event.id);

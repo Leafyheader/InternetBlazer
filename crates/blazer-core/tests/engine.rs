@@ -5,7 +5,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -19,10 +19,11 @@ use axum::{
     routing::get,
 };
 use blazer_core::{
-    Config, DownloadId, Engine, Event, MAX_CONNECTIONS, NewDownload, Queue, QueueId, RedbStore,
-    Settings, Status, Store,
+    CheckState, Config, DownloadId, Engine, Event, MAX_CONNECTIONS, NewDownload, Queue, QueueId,
+    RedbStore, Settings, Status, Store,
 };
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 const CHUNK: usize = 16 * 1024;
@@ -37,6 +38,11 @@ struct Server {
     failing_responses: AtomicUsize,
     fail_after: usize,
     bytes_sent: AtomicU64,
+    /// Set by a test once it resumes a download. Bytes of responses to requests made from then on
+    /// also count in `bytes_sent_resumed`, so bytes that were still on their way when the download
+    /// paused don't count against the resume.
+    resumed: AtomicBool,
+    bytes_sent_resumed: AtomicU64,
     range_requests: AtomicUsize,
     /// Responds 429 beyond this many concurrent transfers; 0 means unlimited.
     max_concurrent: usize,
@@ -49,6 +55,13 @@ struct Server {
     /// Like a CDN seen in the wild: byte ranges give this smaller total, and each one runs on to
     /// the real end of the file, past the bytes it says it holds.
     claimed_len: Option<u64>,
+    /// The next this-many data responses send `stall_after` bytes, then nothing more.
+    stall_responses: AtomicUsize,
+    stall_after: usize,
+    /// Serves every byte inverted: the same size, different content.
+    inverted: AtomicBool,
+    /// Holds back ranged responses for the file's start, other than the probe, this long.
+    first_part_delay: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,6 +69,8 @@ enum RangeFault {
     Missing,
     WrongStart,
     WrongTotal,
+    /// A correct `Content-Range`, but the body is the file's start.
+    FromStart,
 }
 
 /// Counts a response body as in flight until it is dropped.
@@ -78,6 +93,8 @@ impl Server {
             failing_responses: AtomicUsize::new(0),
             fail_after: 0,
             bytes_sent: AtomicU64::new(0),
+            resumed: AtomicBool::new(false),
+            bytes_sent_resumed: AtomicU64::new(0),
             range_requests: AtomicUsize::new(0),
             max_concurrent: 0,
             concurrent: Arc::default(),
@@ -85,6 +102,10 @@ impl Server {
             error_responses: AtomicUsize::new(0),
             range_fault: parking_lot::Mutex::new(None),
             claimed_len: None,
+            stall_responses: AtomicUsize::new(0),
+            stall_after: 0,
+            inverted: AtomicBool::new(false),
+            first_part_delay: Duration::ZERO,
         }
     }
 
@@ -152,10 +173,15 @@ async fn serve(State(server): State<Arc<Server>>, headers: HeaderMap) -> Respons
             .unwrap();
     }
 
-    let mut resp = Response::builder().header(header::ETAG, &etag);
+    let mut resp = Response::builder();
+    if !etag.is_empty() {
+        resp = resp.header(header::ETAG, &etag);
+    }
     if server.ranges {
         resp = resp.header(header::ACCEPT_RANGES, "bytes");
     }
+    // Where in the data the body starts, if not at `start`.
+    let mut source = None;
     let (start, end) = match range {
         Some((start, _)) if start >= len => {
             return resp
@@ -180,6 +206,10 @@ async fn serve(State(server): State<Arc<Server>>, headers: HeaderMap) -> Respons
                 Some(RangeFault::WrongTotal) => {
                     Some(format!("bytes {start}-{}/{}", end - 1, len + 1))
                 }
+                Some(RangeFault::FromStart) => {
+                    source = Some(0);
+                    Some(format!("bytes {start}-{}/{len}", end - 1))
+                }
             };
             if let Some(content_range) = content_range {
                 resp = resp.header(header::CONTENT_RANGE, content_range);
@@ -197,12 +227,30 @@ async fn serve(State(server): State<Arc<Server>>, headers: HeaderMap) -> Respons
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
         .ok()
         .map(|_| server.fail_after);
+    let stall_at = (!probe)
+        .then(|| {
+            server
+                .stall_responses
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .ok()
+        })
+        .flatten()
+        .map(|_| server.stall_after);
+    if !probe && range.is_some_and(|(start, _)| start == 0) {
+        tokio::time::sleep(server.first_part_delay).await;
+    }
+    let shift = source.map_or(0, |source| start - source);
+    let inverted = server.inverted.load(Ordering::Relaxed);
+    let resumed = server.resumed.load(Ordering::Relaxed);
     let body = futures_util::stream::unfold((start, 0), move |(pos, sent)| {
         let server = server.clone();
         let _guard = &guard;
         async move {
             if pos >= end {
                 return None;
+            }
+            if stall_at.is_some_and(|limit| sent >= limit) {
+                std::future::pending::<()>().await;
             }
             if fail_at.is_some_and(|limit| sent >= limit) {
                 return Some((Err(io::Error::other("injected failure")), (end, sent)));
@@ -211,8 +259,16 @@ async fn serve(State(server): State<Arc<Server>>, headers: HeaderMap) -> Respons
                 tokio::time::sleep(server.chunk_delay).await;
             }
             let n = CHUNK.min((end - pos) as usize);
-            let chunk = Bytes::copy_from_slice(&server.data[pos as usize..pos as usize + n]);
+            let from = (pos - shift) as usize;
+            let mut chunk = server.data[from..from + n].to_vec();
+            if inverted {
+                chunk.iter_mut().for_each(|b| *b = !*b);
+            }
+            let chunk = Bytes::from(chunk);
             server.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+            if resumed {
+                server.bytes_sent_resumed.fetch_add(n as u64, Ordering::Relaxed);
+            }
             Some((Ok(chunk), (pos + n as u64, sent + n)))
         }
     });
@@ -352,13 +408,15 @@ async fn resumes_after_restart_without_refetching() {
     let record = engine.get(id).unwrap();
     assert_eq!(record.status, Status::Paused);
     assert!(record.downloaded() >= size as u64 / 3);
+    let missing = size as u64 - record.downloaded();
+    server.resumed.store(true, Ordering::Relaxed);
     engine.start(id).unwrap();
     let record = engine.wait(id).await.unwrap();
 
     assert_eq!(record.status, Status::Completed, "{:?}", record.error);
     assert_saved(tmp.path(), &server.data);
-    let sent = server.bytes_sent.load(Ordering::Relaxed);
-    assert!(sent < size as u64 * 5 / 4, "server sent {sent} bytes for a {size}-byte file");
+    let sent = server.bytes_sent_resumed.load(Ordering::Relaxed);
+    assert!(sent < missing * 5 / 4, "server sent {sent} bytes for {missing} missing bytes");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -463,12 +521,17 @@ async fn a_moved_paused_download_resumes_in_its_new_place() {
     engine.move_to(id, dest.clone(), "x.bin").await.unwrap();
     assert!(dest.join("x.bin.part").exists());
     assert!(!paused.part_path().exists());
+    let missing = size as u64 - engine.get(id).unwrap().downloaded();
+    server.resumed.store(true, Ordering::Relaxed);
     engine.start(id).unwrap();
     let record = engine.wait(id).await.unwrap();
     assert_eq!(record.status, Status::Completed, "{:?}", record.error);
     assert_eq!(std::fs::read(dest.join("x.bin")).unwrap(), server.data);
-    let sent = server.bytes_sent.load(Ordering::Relaxed);
-    assert!(sent < size as u64 * 5 / 4, "the progress moved along ({sent} bytes sent)");
+    let sent = server.bytes_sent_resumed.load(Ordering::Relaxed);
+    assert!(
+        sent < missing * 5 / 4,
+        "the progress moved along ({sent} sent for {missing} missing bytes)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -648,6 +711,33 @@ async fn speed_limits_slow_downloads_down() {
     assert!(elapsed >= 2.5, "took {elapsed}s at a limit of 3s for the whole file");
 }
 
+/// The connections the download sets out with, from its first progress report.
+async fn planned_connections(speed_limit: u64) -> usize {
+    let (_server, url) = Server::new(1024 * 1024).spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+    let mut events = engine.subscribe();
+    let mut new = NewDownload::new(&url, tmp.path());
+    new.speed_limit = Some(speed_limit);
+    let id = engine.add(new).await.unwrap();
+    let planned = loop {
+        match events.recv().await {
+            Ok(Event::Progress(p)) if p.id == id => break p.planned,
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => unreachable!(),
+        }
+    };
+    engine.pause(id);
+    engine.shutdown().await;
+    planned
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_very_low_speed_limit_uses_two_connections() {
+    assert_eq!(planned_connections(10 * 1024).await, 2);
+    assert_eq!(planned_connections(11 * 1024).await, config().connections);
+}
+
 /// Raw engine throughput on localhost. Run with:
 /// `cargo test --release -p blazer-core --test engine -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread")]
@@ -732,6 +822,83 @@ async fn adds_the_extension_the_first_bytes_show() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_range_from_a_file_of_another_size_counts_as_a_change() {
     let record = ranged_download_with(RangeFault::WrongTotal).await;
+    assert_eq!(record.status, Status::Failed);
+    assert!(record.error.unwrap().contains("changed"));
+}
+
+/// The later parts all end before the file's start arrives to compare them with.
+#[tokio::test(flavor = "multi_thread")]
+async fn notices_parts_holding_the_start_of_the_file_when_the_start_comes_last() {
+    let mut server = Server::new(1024 * 1024);
+    server.first_part_delay = Duration::from_millis(800);
+    *server.range_fault.lock() = Some(RangeFault::FromStart);
+    let (server, url) = server.spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert!(!record.resumable, "the server's ranges cannot be trusted");
+    assert_saved(tmp.path(), &server.data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_in_one_piece_when_parts_hold_the_start_of_the_file() {
+    let server = Server::new(1024 * 1024);
+    *server.range_fault.lock() = Some(RangeFault::FromStart);
+    let (server, url) = server.spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert!(!record.resumable, "the server's ranges cannot be trusted");
+    assert_saved(tmp.path(), &server.data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn races_a_connection_that_goes_silent() {
+    let mut server = Server::new(1024 * 1024);
+    server.stall_responses = AtomicUsize::new(1);
+    server.stall_after = 16 * 1024;
+    let (server, url) = server.spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+
+    let started = std::time::Instant::now();
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_saved(tmp.path(), &server.data);
+    // Rather than waiting out the 30 s read timeout on the silent connection. Under heavy load
+    // the race waits for the process to get enough CPU again, so this leaves room for that.
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(20), "took {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notices_a_changed_file_without_validators_on_resume() {
+    let size = 2 * 1024 * 1024;
+    let mut server = Server::new(size);
+    server.chunk_delay = Duration::from_millis(10);
+    *server.etag.lock() = String::new();
+    let (server, url) = server.spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    pause_after(&engine, id, size as u64 / 4).await;
+    engine.wait(id).await.unwrap();
+
+    // Same size, no ETag or date to tell: only the bytes show the change.
+    server.inverted.store(true, Ordering::Relaxed);
+    engine.start(id).unwrap();
+    let record = settle(&engine, id).await;
     assert_eq!(record.status, Status::Failed);
     assert!(record.error.unwrap().contains("changed"));
 }
@@ -969,8 +1136,9 @@ async fn pause_after_shutdown(engine: &Engine, id: DownloadId) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_address_for_the_same_file_keeps_the_progress() {
     let size = 2 * 1024 * 1024;
+    // Slow enough that the download is still running when it is paused, even under load.
     let mut old = Server::new(size);
-    old.chunk_delay = Duration::from_millis(5);
+    old.chunk_delay = Duration::from_millis(10);
     let (old, old_url) = old.spawn().await;
     // Paced, so a connection does not run far past a split before it notices.
     let mut new = Server::new(size);
@@ -998,4 +1166,49 @@ async fn a_new_address_for_the_same_file_keeps_the_progress() {
     let missing = size as u64 - paused.downloaded();
     assert!(sent < missing * 5 / 4, "sent {sent} for {missing} missing bytes");
     assert!(old.bytes_sent.load(Ordering::Relaxed) < size as u64);
+}
+
+/// Waits until the download's SHA-256 check is no longer under way, and returns what it found.
+async fn checked(engine: &Engine, id: DownloadId) -> CheckState {
+    let mut events = engine.subscribe();
+    loop {
+        let state = engine.get(id).unwrap().checksum.expect("a SHA-256 to check").state;
+        if state != CheckState::Checking {
+            return state;
+        }
+        if let Err(RecvError::Closed) = events.recv().await {
+            unreachable!();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn checks_the_sha256_of_the_finished_file() {
+    let (server, url) = Server::new(1024 * 1024 + 7).spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = open(tmp.path());
+    let hash: String = Sha256::digest(&server.data).iter().map(|b| format!("{b:02x}")).collect();
+
+    let mut bad = NewDownload::new(&url, tmp.path());
+    bad.sha256 = Some("not a hash".into());
+    assert!(engine.add(bad).await.is_err());
+
+    // As `sha256sum` prints it, in capitals.
+    let mut new = NewDownload::new(&url, tmp.path());
+    new.sha256 = Some(format!("{}  file.bin", hash.to_uppercase()));
+    let id = engine.add(new).await.unwrap();
+    let record = engine.wait(id).await.unwrap();
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_eq!(checked(&engine, id).await, CheckState::Matched);
+
+    engine.set_sha256(id, Some(&"0".repeat(64))).unwrap();
+    assert_eq!(checked(&engine, id).await, CheckState::Mismatched { actual: hash });
+
+    std::fs::remove_file(tmp.path().join("file.bin")).unwrap();
+    engine.check_sha256(id).unwrap();
+    assert!(matches!(checked(&engine, id).await, CheckState::Failed { .. }));
+
+    assert!(engine.set_sha256(id, Some("abc")).is_err());
+    engine.set_sha256(id, None).unwrap();
+    assert_eq!(engine.get(id).unwrap().checksum, None);
 }

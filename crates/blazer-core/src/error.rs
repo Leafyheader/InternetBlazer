@@ -33,6 +33,10 @@ pub enum Error {
     /// the sizes the server gives cannot be trusted either.
     #[error("server sent more data than the part of the file it said it was sending")]
     RangeOverflow,
+    /// A response for a later part of the file whose bytes are the file's start, whatever its
+    /// `Content-Range` says.
+    #[error("server sent the start of the file instead of the part asked for")]
+    RangeFromStart,
     #[error("the file on the server changed since the download started")]
     RemoteChanged,
     #[error("connection closed before the segment was complete")]

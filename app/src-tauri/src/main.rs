@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use futures_util::StreamExt;
 use blazer_core::{
-    Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, MediaFormat, MediaInfo,
+    CheckState, Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, MediaFormat, MediaInfo,
     MediaTools, NewDownload, Queue, QueueId, Settings, Status, Tool,
 };
 use bridge::{Bridge, Incoming};
@@ -61,6 +61,9 @@ struct AddRequest {
     /// The video on the page to download, rather than the page.
     #[serde(default)]
     media: Option<MediaFormat>,
+    /// The SHA-256 the file should have, checked once it finishes.
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[tauri::command]
@@ -148,6 +151,7 @@ async fn add_download(
     new.start = request.start;
     new.headers = request.headers;
     new.media = request.media;
+    new.sha256 = request.sha256.filter(|hash| !hash.trim().is_empty());
     let id = engine.add(new).await.map_err(message)?;
     if let Err(e) = prefs.update(|p| p.last_dir = Some(dir)) {
         tracing::warn!("saving the last folder used: {e:#}");
@@ -285,6 +289,21 @@ async fn set_download_speed_limit(
     limit: Option<u64>,
 ) -> CmdResult<()> {
     engine.set_download_speed_limit(id, limit).map_err(message)
+}
+
+/// Sets the SHA-256 the file should have, from text holding one, or forgets it with `None`.
+#[tauri::command]
+async fn set_download_sha256(
+    engine: State<'_, Engine>,
+    id: DownloadId,
+    sha256: Option<String>,
+) -> CmdResult<()> {
+    engine.set_sha256(id, sha256.as_deref()).map_err(message)
+}
+
+#[tauri::command]
+async fn check_download_sha256(engine: State<'_, Engine>, id: DownloadId) -> CmdResult<()> {
+    engine.check_sha256(id).map_err(message)
 }
 
 #[tauri::command]
@@ -601,6 +620,22 @@ fn notify_status(
     }
 }
 
+/// Tells the user when a finished file turned out not to be the one its SHA-256 belongs to.
+fn notify_check(app: &AppHandle, engine: &Engine, id: DownloadId, state: &CheckState) {
+    let Ok(record) = engine.get(id) else { return };
+    match state {
+        CheckState::Mismatched { .. } => notify(
+            app,
+            "SHA-256 doesn't match",
+            format!("{}: it's damaged, or not the file the hash belongs to", record.file_name),
+        ),
+        CheckState::Failed { error } => {
+            notify(app, "Couldn't check the SHA-256", format!("{}: {error}", record.file_name));
+        }
+        CheckState::Waiting | CheckState::Checking | CheckState::Matched => {}
+    }
+}
+
 fn forward_events(app: AppHandle, engine: &Engine) {
     let mut events = engine.subscribe();
     let engine = engine.clone();
@@ -613,6 +648,9 @@ fn forward_events(app: AppHandle, engine: &Engine) {
                     app.state::<Finish>().observe(&app, &engine, &event);
                     if let Event::StatusChanged { id, status, error } = &event {
                         notify_status(&app, &engine, *id, *status, error.as_deref());
+                    }
+                    if let Event::ChecksumChanged { id, checksum: Some(checksum) } = &event {
+                        notify_check(&app, &engine, *id, &checksum.state);
                     }
                     let _ = app.emit("download-event", event);
                 }
@@ -727,6 +765,8 @@ fn main() {
             remove_download,
             set_download_queue,
             set_download_speed_limit,
+            set_download_sha256,
+            check_download_sha256,
             list_queues,
             add_queue,
             update_queue,

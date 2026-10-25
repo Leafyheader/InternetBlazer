@@ -73,10 +73,18 @@ pub struct DownloadRecord {
     /// Bytes per second, applied on top of the global limit.
     #[serde(default)]
     pub speed_limit: Option<u64>,
-    /// Set for a video or audio on a web page, which yt-dlp downloads instead of the engine.
-    /// `file_name` is then a guess until it finishes, since yt-dlp picks the final extension.
+    /// Set for a video or audio on a web page, which yt-dlp downloads instead of the engine,
+    /// unless it is a [`stream`](Self::stream). `file_name` is then a guess until it finishes,
+    /// since the final extension depends on what the site sends.
     #[serde(default)]
     pub media: Option<MediaFormat>,
+    /// For a media download: `url` is an HLS or DASH playlist, whose pieces the engine downloads
+    /// itself instead of yt-dlp.
+    #[serde(default)]
+    pub stream: bool,
+    /// For such a stream, how far each of its tracks got.
+    #[serde(default)]
+    pub tracks: Vec<TrackProgress>,
     /// For a media download, a single segment that counts its bytes.
     pub segments: Vec<Segment>,
     pub status: Status,
@@ -96,6 +104,9 @@ pub struct DownloadRecord {
     /// added before this was kept.
     #[serde(default)]
     pub last_try_at: Option<u64>,
+    /// The SHA-256 the file should have, checked once it finishes.
+    #[serde(default)]
+    pub checksum: Option<Checksum>,
 }
 
 impl DownloadRecord {
@@ -113,6 +124,25 @@ impl DownloadRecord {
     }
 }
 
+/// How much of one track of an HLS or DASH stream, such as its picture or its sound, is in its
+/// file. Pieces are written in order, so a paused download goes on from the next one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackProgress {
+    /// Pieces written, from the first.
+    pub pieces: usize,
+    /// Pieces the track has, which tells whether a playlist read again is still the same.
+    pub total_pieces: usize,
+    /// The length of the track's file.
+    pub bytes: u64,
+}
+
+impl TrackProgress {
+    pub fn is_complete(&self) -> bool {
+        self.pieces == self.total_pieces
+    }
+}
+
 /// An automatic retry: the how-manyth in a row, and when it starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +151,28 @@ pub struct Retry {
     pub attempt: u32,
     /// Unix timestamp in seconds.
     pub at: u64,
+}
+
+/// A SHA-256 the downloaded file should have, such as one published next to the link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Checksum {
+    /// In lowercase hex.
+    pub expected: String,
+    pub state: CheckState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CheckState {
+    /// Not checked yet: the download hasn't finished, or the check was cut off.
+    Waiting,
+    Checking,
+    Matched,
+    /// The file is damaged, or isn't the one the hash belongs to.
+    Mismatched { actual: String },
+    /// The file couldn't be read, such as after it was moved or deleted outside the app.
+    Failed { error: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +303,11 @@ pub enum Event {
     Updated(DownloadRecord),
     Removed {
         id: DownloadId,
+    },
+    /// The expected SHA-256 was set or cleared, or a check of it started or ended.
+    ChecksumChanged {
+        id: DownloadId,
+        checksum: Option<Checksum>,
     },
     /// A queue was added, changed or removed.
     QueuesChanged,

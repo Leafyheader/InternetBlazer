@@ -8,7 +8,7 @@
   import { onMount } from "svelte";
   import { api, type Incoming, type LinkInfo, MAIN_QUEUE, type MediaInfo } from "./api";
   import { downloads } from "./downloads.svelte";
-  import { bytes } from "./format";
+  import { bytes, parseSha256 } from "./format";
   import Icon from "./Icon.svelte";
 
   let {
@@ -38,6 +38,9 @@
   // svelte-ignore state_referenced_locally
   let queue = $state(initialQueue);
   let start = $state(true);
+  /** Text holding the SHA-256 to check the finished file against. */
+  let sha256 = $state("");
+  let badSha256 = $derived(sha256.trim() !== "" && parseSha256(sha256) === null);
   let busy = $state(false);
   let error = $state("");
   let dialog: HTMLDialogElement;
@@ -71,8 +74,22 @@
   let free = $state<number | null>(null);
   let tooBig = $derived(size !== null && free !== null && size > free);
 
-  /** Finds the videos on a page, getting yt-dlp first if it isn't there yet. */
-  async function findMedia(target: string, headers: [string, string][], report: (s: string) => void) {
+  /** Finds the videos on a page, getting yt-dlp first if it isn't there yet. A playlist is read
+   * without yt-dlp, which is only fetched if the engine can't read it after all. */
+  async function findMedia(
+    target: string,
+    headers: [string, string][],
+    playlist: boolean,
+    report: (s: string) => void,
+  ) {
+    if (playlist && !ytdlpReady) {
+      report("Reading the video's playlist…");
+      try {
+        return await api.inspectMedia(target, headers);
+      } catch (err) {
+        if (!String(err).includes("yt-dlp, which is not installed")) throw err;
+      }
+    }
     if (!ytdlpReady) {
       if (!(await api.mediaTools()).ytdlp) {
         report("Getting yt-dlp, which downloads videos…");
@@ -116,7 +133,7 @@
         // A video's HLS or DASH playlist is a small file of its own, but it stands for the video.
         const playlist = /\.(m3u8|mpd)([?#]|$)/i.test(target) || (prefill?.media && target === prefill.url);
         if (!page && !playlist) return;
-        const found = await findMedia(target, headers, (s) => !stale && (stage = s));
+        const found = await findMedia(target, headers, !!playlist, (s) => !stale && (stage = s));
         if (stale) return;
         if (found.choices.length > 0) {
           media = found;
@@ -212,6 +229,7 @@
         start,
         headers: prefill?.headers ?? [],
         media: chosen?.format ?? null,
+        sha256: parseSha256(sha256),
       });
       onclose();
     } catch (err) {
@@ -316,6 +334,19 @@
       </label>
     </div>
 
+    <label>
+      <span>SHA-256 <span class="muted">(optional)</span></span>
+      <input
+        bind:value={sha256}
+        placeholder="Paste the hash the site gives, to check the file once it's downloaded"
+        spellcheck="false"
+        aria-invalid={badSha256}
+      />
+      {#if badSha256}
+        <span class="link-info warn">A SHA-256 is 64 characters of 0-9 and a-f.</span>
+      {/if}
+    </label>
+
     <div class="inline">
       <label class="grow">
         <span>Queue</span>
@@ -337,7 +368,7 @@
 
     <footer>
       <button type="button" onclick={() => dialog.close()}>Cancel</button>
-      <button type="submit" class="primary" disabled={busy}>
+      <button type="submit" class="primary" disabled={busy || badSha256}>
         {busy ? "Checking link…" : start ? "Download" : "Add"}
       </button>
     </footer>

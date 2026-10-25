@@ -27,7 +27,7 @@ use crate::{
     limit::RateLimiter,
     media, probe,
     segment::{Claim, Plan},
-    sniff,
+    sniff, stream,
     types::{self, DownloadId, DownloadRecord, Event, Progress, Retry, Status},
 };
 
@@ -39,6 +39,29 @@ const MAX_BACKOFF_SHIFT: u32 = 5;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// How long a finished range may take to end its response.
 const END_CHECK: Duration = Duration::from_secs(2);
+/// How much of the file's start is kept, to recognize a response that sends it again in place
+/// of a later part.
+const HEAD_LEN: usize = 2048;
+/// Bytes of a response that must equal the file's start for it to count as the start again.
+const START_MATCH: usize = 512;
+/// How many later responses' first bytes are kept, to tell a server that sends the same start
+/// for every range from a file that changed.
+const MAX_STARTS: usize = 64;
+/// A download limited to this many bytes per second or fewer, by its own limit or the global
+/// one, uses at most [`SLOW_LIMIT_CONNECTIONS`].
+const SLOW_LIMIT: u64 = 10 * 1024;
+const SLOW_LIMIT_CONNECTIONS: usize = 2;
+/// How often a connection with nothing left to do looks for a silent one to race.
+const RACE_POLL: Duration = Duration::from_millis(250);
+/// How often a download checks that its tasks get to run when they should.
+const STARVATION_CHECK: Duration = Duration::from_millis(100);
+/// Waking this much later than asked means the process was starved, as on a machine at full
+/// load. A connection then looks silent while its data waits unread, so racing it would only
+/// fetch the same bytes twice.
+const STARVED_LAG: Duration = Duration::from_millis(50);
+/// No race starts for this long after the process was starved, since the silences seen until
+/// then may be the starving's doing. Longer than the usual wait before a race.
+const STARVED_HOLD: Duration = Duration::from_secs(3);
 
 /// State shared by the connection workers of one download.
 struct Shared {
@@ -53,6 +76,13 @@ struct Shared {
     ranged: bool,
     plan: Mutex<Plan>,
     file: Arc<File>,
+    /// The first [`HEAD_LEN`] bytes of the file, as far as they have arrived.
+    head: Mutex<Vec<u8>>,
+    /// The first bytes of later parts that ended before the file's start arrived to compare
+    /// them with, as when the first connection is the slowest. Compared once the download ends.
+    unchecked: Mutex<Vec<Vec<u8>>>,
+    /// The first [`START_MATCH`] bytes of later responses, with where they were asked from.
+    starts: Mutex<Vec<(u64, Vec<u8>)>>,
     /// This download's own limit; the global one is in [`Inner`].
     limiter: Arc<RateLimiter>,
     inner: Arc<Inner>,
@@ -73,6 +103,8 @@ struct Shared {
     throttled: AtomicUsize,
     /// Why a connection last failed. The reporter clears it once data arrives again.
     trouble: Mutex<Option<String>>,
+    /// When the download's tasks last ran late; see [`STARVED_LAG`].
+    starved_at: Mutex<Option<std::time::Instant>>,
     max_retries: u32,
     retry_delay: Duration,
     write_buffer: usize,
@@ -99,12 +131,26 @@ pub(crate) async fn run(
     let previous = record.retry.take();
     let mut retry_in = None;
     let mut result = match record.media {
+        Some(_) if record.stream => {
+            match stream::execute(&inner, &mut record, &cancel, limiter.clone()).await {
+                // Such as a live stream, which has no end for the engine to download to.
+                Err(Error::NotPlaylist) => {
+                    tracing::info!(%id, "leaving the stream to yt-dlp");
+                    record.stream = false;
+                    record.tracks.clear();
+                    media::execute(&inner, &mut record, &cancel, limiter.clone()).await
+                }
+                result => result,
+            }
+        }
         Some(_) => media::execute(&inner, &mut record, &cancel, limiter.clone()).await,
         None => execute(&inner, &mut record, &cancel, limiter.clone()).await,
     };
-    if matches!(result, Err(Error::RangeOverflow)) {
-        // Some CDNs give byte ranges the size of a compressed copy while sending the real file.
-        // A plain request for the whole file, which such servers get right, is the way out.
+    if record.media.is_none() && matches!(result, Err(Error::RangeOverflow | Error::RangeFromStart))
+    {
+        // Some CDNs give byte ranges the size of a compressed copy while sending the real file,
+        // and some send the file from its start whatever range was asked for. A plain request
+        // for the whole file, which such servers get right, is the way out.
         tracing::warn!(%id, "server's byte ranges are unreliable; downloading in one piece");
         record.resumable = false;
         record.total = None;
@@ -145,6 +191,9 @@ pub(crate) async fn run(
         tracing::error!(%id, "failed to save download: {e}");
     }
     inner.emit(Event::StatusChanged { id, status: record.status, error: record.error.clone() });
+    if record.status == Status::Completed && record.checksum.is_some() {
+        inner.run_check(id);
+    }
     if let Some((retry, delay)) = retry_in {
         inner.retry_later(id, retry, delay);
     }
@@ -209,15 +258,22 @@ async fn execute(
         .await
         .map_err(Error::internal)??;
     let ranged = record.resumable && record.total.is_some();
-    let worker_count = match ranged {
+    let mut worker_count = match ranged {
         true => record.connections.unwrap_or_else(|| inner.connections()).clamp(1, MAX_CONNECTIONS),
         false => 1,
     };
+    // At such a low limit, more connections only add requests and overhead.
+    let limit = [inner.speed_limit.limit(), limiter.limit()].into_iter().flatten().min();
+    if limit.is_some_and(|limit| limit <= SLOW_LIMIT) {
+        worker_count = worker_count.min(SLOW_LIMIT_CONNECTIONS);
+    }
     let plan = if record.segments.is_empty() {
         Plan::new(record.total, ranged, cfg.min_split_size, worker_count)
     } else {
         Plan::from_segments(record.segments.clone(), ranged, cfg.min_split_size)
     };
+    let file = Arc::new(file);
+    let head = read_back(&file, 0, plan.written_from_start().min(HEAD_LEN as u64)).await?;
     let shared = Arc::new(Shared {
         client: inner.client.clone(),
         url: record.url.clone(),
@@ -226,7 +282,10 @@ async fn execute(
         total: record.total,
         ranged,
         plan: Mutex::new(plan),
-        file: Arc::new(file),
+        file,
+        head: Mutex::new(head),
+        unchecked: Mutex::default(),
+        starts: Mutex::default(),
         limiter,
         inner: inner.clone(),
         stop: cancel.child_token(),
@@ -239,6 +298,7 @@ async fn execute(
         received: AtomicU64::new(0),
         throttled: AtomicUsize::new(0),
         trouble: Mutex::new(None),
+        starved_at: Mutex::new(None),
         max_retries: cfg.max_retries,
         retry_delay: cfg.retry_delay,
         write_buffer: cfg.write_buffer,
@@ -251,6 +311,7 @@ async fn execute(
     let reporter_stop = CancellationToken::new();
     let reporter =
         tokio::spawn(report(inner.clone(), shared.clone(), record.clone(), reporter_stop.clone()));
+    let watchdog = tokio::spawn(watch_starvation(shared.clone(), reporter_stop.clone()));
 
     let mut last_error = None;
     while let Some(joined) = workers.join_next().await {
@@ -262,8 +323,9 @@ async fn execute(
     }
     reporter_stop.cancel();
     let _ = reporter.await;
+    let _ = watchdog.await;
 
-    let Shared { plan, file, fatal, .. } =
+    let Shared { plan, file, fatal, head, unchecked, .. } =
         Arc::into_inner(shared).expect("workers and reporter have finished");
     let plan = plan.into_inner();
     record.segments = plan.segments();
@@ -283,6 +345,10 @@ async fn execute(
         return Err(e);
     }
     if complete {
+        let head = head.into_inner();
+        if unchecked.into_inner().iter().any(|bytes| same_start(&head, bytes)) {
+            return Err(Error::RangeFromStart);
+        }
         let expected = record.total.unwrap_or(len);
         if len != expected {
             return Err(Error::WrongSize { expected, actual: len });
@@ -362,16 +428,18 @@ async fn worker_loop(sh: &Shared) -> Result<Exit> {
         if sh.stop.is_cancelled() {
             return Ok(Exit::Finished);
         }
-        let Some(claim) = sh.plan.lock().claim() else {
-            sh.idle.fetch_add(1, Ordering::Relaxed);
+        let Some(mut claim) = next_claim(sh).await else {
             return Ok(Exit::Finished);
         };
-        let result = fetch(sh, claim, &mut buf, &mut failures).await;
+        let result = fetch(sh, &mut claim, &mut buf, &mut failures).await;
         // Such as a server found out on the last bytes, which must not pass as complete.
         let fatal = matches!(&result, Err(e) if !e.is_retryable());
         let complete = {
             let mut plan = sh.plan.lock();
-            plan.release(claim.idx);
+            // A racer that never took its segment over has nothing to give back.
+            if !claim.racing {
+                plan.release(claim.idx);
+            }
             plan.is_complete()
         };
         if complete && !fatal {
@@ -418,11 +486,72 @@ async fn worker_loop(sh: &Shared) -> Result<Exit> {
     }
 }
 
+/// Finds work for a connection. In a ranged download, a connection with nothing left to do
+/// stays around to race any connection that goes silent, while others are still at work. It
+/// does not take up segments that others gave up on, so that their failure ends the download
+/// as soon as it did before rather than after each waiting connection's retries.
+async fn next_claim(sh: &Shared) -> Option<Claim> {
+    let may_race = || sh.may_race();
+    if let Some(claim) = sh.plan.lock().claim_with(std::time::Instant::now(), may_race()) {
+        return Some(claim);
+    }
+    sh.idle.fetch_add(1, Ordering::Relaxed);
+    if !sh.ranged {
+        return None;
+    }
+    loop {
+        tokio::select! {
+            () = time::sleep(RACE_POLL) => {}
+            () = sh.stop.cancelled() => return None,
+        }
+        let mut plan = sh.plan.lock();
+        if !plan.is_busy() {
+            return None;
+        }
+        if may_race()
+            && let Some(race) = plan.claim_race(std::time::Instant::now())
+        {
+            sh.idle.fetch_sub(1, Ordering::Relaxed);
+            return Some(race);
+        }
+    }
+}
+
+/// Reads `len` bytes of the file at `offset` back from disk.
+async fn read_back(file: &Arc<File>, offset: u64, len: u64) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let file = file.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let mut bytes = vec![0; len as usize];
+        fsio::read_at(&file, &mut bytes, offset).map(|()| bytes)
+    })
+    .await
+    .map_err(Error::internal)??;
+    Ok(bytes)
+}
+
 /// Downloads one claimed segment until it is done, the connection fails, or the download stops.
-async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32) -> Result<()> {
+///
+/// The request starts up to [`OVERLAP`](crate::segment::OVERLAP) bytes early when those are on disk already, and fails
+/// if the server sends them differently: the file changed. A racing claim takes its segment
+/// over on its first new bytes, and updates `claim` to its own; it stops quietly if it lost.
+async fn fetch(
+    sh: &Shared,
+    claim: &mut Claim,
+    buf: &mut Vec<u8>,
+    failures: &mut u32,
+) -> Result<()> {
+    let (overlap, mut cut) = {
+        let plan = sh.plan.lock();
+        (plan.overlap(claim), plan.stopper(claim))
+    };
+    let expected = read_back(&sh.file, claim.from - overlap, overlap).await?;
+    let first = claim.from - overlap;
     let mut req = probe::request(&sh.client, &sh.url, &sh.headers);
     if sh.ranged {
-        req = req.header(header::RANGE, format!("bytes={}-{}", claim.from, claim.end - 1));
+        req = req.header(header::RANGE, format!("bytes={first}-{}", claim.end - 1));
         if let Some(validator) = &sh.validator {
             req = req.header(header::IF_RANGE, validator);
         }
@@ -430,6 +559,7 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
     let resp = tokio::select! {
         resp = req.send() => resp?,
         () = sh.stop.cancelled() => return Ok(()),
+        () = cut.cancelled() => return Ok(()),
     };
     let status = resp.status();
     if sh.ranged {
@@ -446,7 +576,7 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
         if range.total.is_some() && range.total != sh.total {
             return Err(Error::RemoteChanged);
         }
-        if range.start != Some(claim.from) {
+        if range.start != Some(first) {
             return Err(Error::RangeIgnored);
         }
     } else if !status.is_success() {
@@ -458,8 +588,13 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
     let mut offset = claim.from;
     // What this response may hold. The claim can shrink while it runs, when another
     // connection takes over its end, but the request cannot.
-    let requested = claim.end - claim.from;
+    let requested = claim.end - first;
     let mut body = 0u64;
+    // Overlap bytes checked so far.
+    let mut checked = 0;
+    // The first bytes of a later part, until they are compared with the file's start.
+    let mut start =
+        StartCheck { sh, bytes: (sh.ranged && claim.from > 0).then(Vec::new), kept: false };
     buf.clear();
     loop {
         let next = tokio::select! {
@@ -468,15 +603,70 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
                 flush(sh, claim.idx, offset, buf).await?;
                 return Ok(());
             }
+            () = cut.cancelled() => {
+                flush(sh, claim.idx, offset, buf).await?;
+                return Ok(());
+            }
             next = stream.next() => next,
         };
         match next {
-            Some(Ok(chunk)) => {
+            Some(Ok(mut chunk)) => {
                 body += chunk.len() as u64;
                 if sh.ranged && body > requested {
                     return Err(Error::RangeOverflow);
                 }
-                let (take, done) = sh.plan.lock().reserve(claim.idx, chunk.len());
+                if checked < expected.len() {
+                    let n = (expected.len() - checked).min(chunk.len());
+                    if chunk[..n] != expected[checked..checked + n] {
+                        // A server that sends the same start whatever is asked looks like a
+                        // changed file here, but a download in one piece gets it right.
+                        if checked == 0 && sends_a_start_again(sh, first, &chunk) {
+                            return Err(Error::RangeFromStart);
+                        }
+                        tracing::warn!(
+                            at = first + checked as u64,
+                            "bytes on disk differ from the server's"
+                        );
+                        return Err(Error::RemoteChanged);
+                    }
+                    checked += n;
+                    chunk = chunk.slice(n..);
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                }
+                if claim.racing {
+                    let won = sh.plan.lock().take_over(*claim);
+                    let Some(won) = won else { return Ok(()) };
+                    tracing::debug!(from = won.from, "a racing connection took over a silent one");
+                    *claim = won;
+                    cut = sh.plan.lock().stopper(claim);
+                }
+                if let Some(bytes) = &mut start.bytes {
+                    if is_file_start(sh, bytes, &chunk) {
+                        return Err(Error::RangeFromStart);
+                    }
+                    if bytes.len() >= START_MATCH && !start.kept {
+                        start.kept = true;
+                        let mut starts = sh.starts.lock();
+                        if starts.len() < MAX_STARTS {
+                            starts.push((claim.from, bytes.clone()));
+                        }
+                    }
+                    if bytes.len() >= START_MATCH && sh.head.lock().len() >= START_MATCH {
+                        start.bytes = None;
+                    }
+                }
+                let now = std::time::Instant::now();
+                let (take, done) = sh.plan.lock().reserve(claim.idx, chunk.len(), now);
+                let pos = offset + buf.len() as u64;
+                if sh.ranged && pos < HEAD_LEN as u64 {
+                    let mut head = sh.head.lock();
+                    if head.len() as u64 == pos {
+                        let n = (HEAD_LEN - head.len()).min(take);
+                        head.extend_from_slice(&chunk[..n]);
+                    }
+                }
                 buf.extend_from_slice(&chunk[..take]);
                 if take > 0 {
                     *failures = 0;
@@ -516,6 +706,50 @@ async fn fetch(sh: &Shared, claim: Claim, buf: &mut Vec<u8>, failures: &mut u32)
     }
 }
 
+/// Whether a later part's first bytes, gathered in `bytes` as `data` arrives, are the file's
+/// start: a server that ignores the range while saying otherwise. A start of one repeated byte,
+/// such as the zeros many disk images begin with, proves nothing and is not compared.
+fn is_file_start(sh: &Shared, bytes: &mut Vec<u8>, data: &[u8]) -> bool {
+    if bytes.len() < START_MATCH {
+        let n = (START_MATCH - bytes.len()).min(data.len());
+        bytes.extend_from_slice(&data[..n]);
+    }
+    same_start(&sh.head.lock(), bytes)
+}
+
+/// Whether a response asked for at `from` begins with `data` as the file does, or as another
+/// response asked for elsewhere did.
+fn sends_a_start_again(sh: &Shared, from: u64, data: &[u8]) -> bool {
+    same_start(&sh.head.lock(), data)
+        || sh.starts.lock().iter().any(|(at, start)| *at != from && same_start(start, data))
+}
+
+/// Whether `bytes` begin like the file, by its first bytes in `head`.
+fn same_start(head: &[u8], bytes: &[u8]) -> bool {
+    if bytes.len() < START_MATCH || head.len() < START_MATCH {
+        return false;
+    }
+    let head = &head[..START_MATCH];
+    head == &bytes[..START_MATCH] && head.iter().any(|&b| b != head[0])
+}
+
+/// A later part's first bytes. If the part ends before they could be compared with the file's
+/// start, they are kept for [`execute`] to compare at the end.
+struct StartCheck<'a> {
+    sh: &'a Shared,
+    bytes: Option<Vec<u8>>,
+    /// Whether they are in [`Shared::starts`].
+    kept: bool,
+}
+
+impl Drop for StartCheck<'_> {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.bytes.take().filter(|b| b.len() >= START_MATCH) {
+            self.sh.unchecked.lock().push(bytes);
+        }
+    }
+}
+
 /// After all the bytes a range asked for, the response must end. A server that sends more
 /// gives byte ranges of a different file than it serves.
 async fn check_ended<S, T, E>(sh: &Shared, stream: &mut S) -> Result<()>
@@ -535,7 +769,28 @@ where
     }
 }
 
+/// Notes when the download's tasks run late, until `stop` fires.
+async fn watch_starvation(sh: Arc<Shared>, stop: CancellationToken) {
+    loop {
+        let asleep = Instant::now();
+        tokio::select! {
+            () = time::sleep(STARVATION_CHECK) => {}
+            () = stop.cancelled() => return,
+        }
+        if asleep.elapsed() > STARVATION_CHECK + STARVED_LAG {
+            *sh.starved_at.lock() = Some(std::time::Instant::now());
+        }
+    }
+}
+
 impl Shared {
+    /// Whether a silent connection may be raced. Not under a speed limit, where silence is the
+    /// limit's doing, nor shortly after the process was starved.
+    fn may_race(&self) -> bool {
+        self.throttled.load(Ordering::Relaxed) == 0
+            && self.starved_at.lock().is_none_or(|at| at.elapsed() >= STARVED_HOLD)
+    }
+
     /// Waits as long as the speed limits require after receiving `n` bytes.
     async fn throttle(&self, n: usize) {
         if n > 0 {

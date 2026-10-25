@@ -14,7 +14,7 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
-    download,
+    checksum, download,
     error::{Error, Result},
     filename, fsio,
     limit::{self, RateLimiter},
@@ -23,7 +23,7 @@ use crate::{
     store::{RedbStore, Store},
     tools,
     types::{
-        self, DownloadId, DownloadRecord, Event, LinkInfo, MediaFormat, MediaInfo, MediaTools,
+        self, CheckState, Checksum, DownloadId, DownloadRecord, Event, LinkInfo, MediaFormat, MediaInfo, MediaTools,
         QueueId, Retry, Settings, Status, Tool,
     },
 };
@@ -105,9 +105,13 @@ pub struct NewDownload {
     /// Bytes per second.
     pub speed_limit: Option<u64>,
     /// Downloads the video or sound on the page at `url` with yt-dlp, instead of the file there.
+    /// For an HLS or DASH playlist, which the engine read itself, the engine fetches its pieces.
     pub media: Option<MediaFormat>,
     /// Queue it to start instead of adding it paused.
     pub start: bool,
+    /// The SHA-256 the file should have, checked once it finishes. Any text holding one will do;
+    /// see [`parse_sha256`](crate::parse_sha256).
+    pub sha256: Option<String>,
 }
 
 impl NewDownload {
@@ -122,6 +126,7 @@ impl NewDownload {
             speed_limit: None,
             media: None,
             start: true,
+            sha256: None,
         }
     }
 }
@@ -217,8 +222,88 @@ impl Inner {
         if let Some(stored) = self.store.get(record.id)? {
             record.queue = stored.queue;
             record.speed_limit = stored.speed_limit;
+            record.checksum = stored.checksum;
+        }
+        // Saved as under way, so that waiting for the download to finish also finds the check
+        // started; the caller starts it with `run_check`.
+        if record.status == Status::Completed
+            && let Some(checksum) = &mut record.checksum
+        {
+            checksum.state = CheckState::Checking;
         }
         self.store.save(record)
+    }
+
+    /// Checks the finished file of a download against its SHA-256, unless a check is under way.
+    pub(crate) fn start_check(self: &Arc<Self>, id: DownloadId) -> Result<()> {
+        let mut started = false;
+        let record = self.update(id, |r| {
+            if r.status == Status::Completed
+                && let Some(checksum) = &mut r.checksum
+                && checksum.state != CheckState::Checking
+            {
+                checksum.state = CheckState::Checking;
+                started = true;
+            }
+        })?;
+        if started {
+            self.emit(Event::ChecksumChanged { id, checksum: record.checksum });
+            self.run_check(id);
+        }
+        Ok(())
+    }
+
+    /// Hashes the file of a download whose check is saved as under way, and saves what it found.
+    pub(crate) fn run_check(self: &Arc<Self>, id: DownloadId) {
+        let inner = self.clone();
+        self.tasks.spawn(async move {
+            let path = match inner.store.get(id) {
+                Ok(Some(record)) => record.path(),
+                Ok(None) => return,
+                Err(e) => {
+                    tracing::error!(%id, "failed to load download: {e}");
+                    return;
+                }
+            };
+            let cancel = inner.closed.clone();
+            let hashed =
+                tokio::task::spawn_blocking(move || checksum::hash_file(&path, &cancel)).await;
+            let found = match hashed {
+                Ok(Ok(Some(actual))) => Ok(actual),
+                // Shutting down; it is checked again when the app next starts.
+                Ok(Ok(None)) => return,
+                Ok(Err(e)) if e.kind() == io::ErrorKind::NotFound => {
+                    Err("the file isn't there any more".to_string())
+                }
+                Ok(Err(e)) => Err(format!("couldn't read the file: {e}")),
+                Err(e) => Err(e.to_string()),
+            };
+            let result = inner.update(id, |r| {
+                // Restarted, or given another hash that is checked anew, in the meantime.
+                if r.status != Status::Completed {
+                    return;
+                }
+                if let Some(checksum) = &mut r.checksum
+                    && checksum.state == CheckState::Checking
+                {
+                    checksum.state = match &found {
+                        Ok(actual) if *actual == checksum.expected => CheckState::Matched,
+                        Ok(actual) => CheckState::Mismatched { actual: actual.clone() },
+                        Err(error) => CheckState::Failed { error: error.clone() },
+                    };
+                }
+            });
+            match result {
+                Ok(record) => {
+                    if let Some(checksum) = &record.checksum {
+                        tracing::info!(%id, "checked SHA-256: {:?}", checksum.state);
+                    }
+                    inner.emit(Event::ChecksumChanged { id, checksum: record.checksum });
+                }
+                Err(Error::NotFound(_)) => {}
+                Err(e) => tracing::error!(%id, "failed to save the SHA-256 check: {e}"),
+            }
+        });
     }
 
     fn update(
@@ -325,6 +410,14 @@ impl Engine {
 
     pub fn with_store(store: Arc<dyn Store>, config: Config) -> Result<Self> {
         for mut record in store.list()? {
+            // A check cut off by quitting is done again; see `resume_interrupted`.
+            let mut changed = false;
+            if let Some(checksum) = &mut record.checksum
+                && checksum.state == CheckState::Checking
+            {
+                checksum.state = CheckState::Waiting;
+                changed = true;
+            }
             if record.status != Status::Completed && finished_on_disk(&record) {
                 tracing::info!(id = %record.id, "found finished download; marking it complete");
                 record.status = Status::Completed;
@@ -341,7 +434,7 @@ impl Engine {
                 record.status = Status::Paused;
                 record.retry = None;
                 record.interrupted = true;
-            } else {
+            } else if !changed {
                 continue;
             }
             store.save(&record)?;
@@ -545,6 +638,7 @@ impl Engine {
         let queue = new.queue.unwrap_or(QueueId::MAIN);
         self.queue(queue)?;
         let url = parse_url(&new.url)?;
+        let sha256 = new.sha256.as_deref().map(parse_checksum).transpose()?;
         if new.media.is_some() {
             let ffmpeg = tools::ffmpeg(self.inner.config.tools_dir.as_deref()).is_some();
             if let Some((_, true)) = self.found_media(url.as_str(), ffmpeg) {
@@ -564,6 +658,14 @@ impl Engine {
                 media::guess_name(&found, format)
             }
             (None, None) => filename::sanitize(info.file_name.as_deref().unwrap_or("download")),
+        };
+        // A playlist the engine read itself, rather than a page yt-dlp looked at.
+        let stream = new.media.is_some() && {
+            let ffmpeg = tools::ffmpeg(self.inner.config.tools_dir.as_deref()).is_some();
+            match self.found_media(url.as_str(), ffmpeg) {
+                Some((found, _)) => matches!(found.site.as_str(), "HLS" | "DASH"),
+                None => playlist::looks_like_playlist(&url),
+            }
         };
         let adding = self.inner.adding.lock();
         let in_progress: Vec<PathBuf> = self
@@ -603,6 +705,8 @@ impl Engine {
             queue,
             speed_limit: limit::normalize(new.speed_limit),
             media: new.media,
+            stream,
+            tracks: Vec::new(),
             segments: Vec::new(),
             status: if new.start { Status::Queued } else { Status::Paused },
             error: None,
@@ -611,6 +715,7 @@ impl Engine {
             added_at: types::now(),
             completed_at: None,
             last_try_at: None,
+            checksum: sha256.map(|expected| Checksum { expected, state: CheckState::Waiting }),
         };
         self.inner.store.save(&record)?;
         drop(adding);
@@ -687,9 +792,17 @@ impl Engine {
     }
 
     /// Queues the downloads that were running or waiting to run when the engine last stopped,
-    /// such as when the app quit or crashed. Meant for the desktop app as it starts; a tool
-    /// that only lists downloads should not call it.
+    /// such as when the app quit or crashed, and checks the finished files whose SHA-256 checks
+    /// were cut off. Meant for the desktop app as it starts; a tool that only lists downloads
+    /// should not call it.
     pub fn resume_interrupted(&self) -> Result<()> {
+        for record in self.list()? {
+            if record.status == Status::Completed
+                && record.checksum.as_ref().is_some_and(|c| c.state == CheckState::Waiting)
+            {
+                self.inner.start_check(record.id)?;
+            }
+        }
         self.enqueue(|r| r.interrupted)
     }
 
@@ -728,11 +841,15 @@ impl Engine {
                 r.etag = info.etag;
                 r.last_modified = info.last_modified;
                 r.segments.clear();
+                r.tracks.clear();
                 r.status = Status::Queued;
                 r.error = None;
                 r.retry = None;
                 r.interrupted = false;
                 r.completed_at = None;
+                if let Some(checksum) = &mut r.checksum {
+                    checksum.state = CheckState::Waiting;
+                }
             })?;
         }
         self.inner.emit(Event::StatusChanged { id, status: Status::Queued, error: None });
@@ -881,6 +998,35 @@ impl Engine {
         Ok(())
     }
 
+    /// Sets the SHA-256 the file should have, from any text holding one, or forgets it with
+    /// `None`. A finished file is checked straight away.
+    pub fn set_sha256(&self, id: DownloadId, text: Option<&str>) -> Result<()> {
+        let expected = text.map(parse_checksum).transpose()?;
+        let record = self.inner.update(id, |r| {
+            if r.checksum.as_ref().map(|c| &c.expected) != expected.as_ref() {
+                r.checksum =
+                    expected.map(|expected| Checksum { expected, state: CheckState::Waiting });
+            }
+        })?;
+        self.inner.emit(Event::ChecksumChanged { id, checksum: record.checksum.clone() });
+        if record.checksum.is_some_and(|c| c.state == CheckState::Waiting) {
+            self.inner.start_check(id)?;
+        }
+        Ok(())
+    }
+
+    /// Checks the finished file against its SHA-256 again, as after it was put back in place.
+    pub fn check_sha256(&self, id: DownloadId) -> Result<()> {
+        let record = self.get(id)?;
+        if record.checksum.is_none() {
+            return Err(Error::Invalid("there is no SHA-256 to check the file against".into()));
+        }
+        if record.status != Status::Completed {
+            return Err(Error::Invalid("the file is checked once the download finishes".into()));
+        }
+        self.inner.start_check(id)
+    }
+
     pub fn settings(&self) -> Result<Settings> {
         Ok(self.inner.settings.lock().clone())
     }
@@ -1019,6 +1165,11 @@ fn short_version(text: &str) -> String {
         Some(rest) => rest.split_whitespace().next().unwrap_or(rest).to_string(),
         None => text.to_string(),
     }
+}
+
+fn parse_checksum(text: &str) -> Result<String> {
+    checksum::parse_sha256(text)
+        .ok_or_else(|| Error::Invalid("a SHA-256 is 64 characters of 0-9 and a-f".into()))
 }
 
 fn parse_url(url: &str) -> Result<url::Url> {

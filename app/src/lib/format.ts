@@ -73,6 +73,11 @@ export function minutes(clock: string): number {
   return (h || 0) * 60 + (m || 0);
 }
 
+/** The SHA-256 in pasted text, in lowercase: the first run of 64 hex digits, as the engine reads it. */
+export function parseSha256(text: string): string | null {
+  return text.split(/[^0-9a-f]/i).find((word) => word.length === 64)?.toLowerCase() ?? null;
+}
+
 /** The quality a video download asked for. */
 export function quality(format: MediaFormat): string {
   if (format.type === "audio") return "Audio only";
