@@ -34,6 +34,9 @@ use crate::{
 const SIZE: &str = "BLAZER-SIZE ";
 const PROGRESS: &str = "BLAZER-PROGRESS ";
 const FILE: &str = "BLAZER-FILE ";
+/// Printed with the finished file's path once the downloads are done, just before yt-dlp has
+/// ffmpeg join or fix them.
+const JOIN: &str = "BLAZER-JOIN ";
 /// Most sites split their videos into fragments, which this many connections fetch at once.
 const MAX_FRAGMENT_CONNECTIONS: usize = 8;
 
@@ -287,6 +290,8 @@ fn args(
         "--print",
         "before_dl:BLAZER-SIZE %(filesize,filesize_approx)s",
         "--print",
+        "post_process:BLAZER-JOIN %(filepath)s",
+        "--print",
         "after_move:BLAZER-FILE %(filepath)s",
         // `--print` alone would only pretend to download.
         "--no-simulate",
@@ -385,6 +390,8 @@ struct Tracker {
     receiving: bool,
     speed: u64,
     file: Option<PathBuf>,
+    /// Once the downloads are done: the file ffmpeg is making from them.
+    joining: Option<PathBuf>,
 }
 
 impl Tracker {
@@ -395,6 +402,10 @@ impl Tracker {
             self.estimate = number(size);
         } else if let Some(path) = line.strip_prefix(FILE) {
             self.file = Some(PathBuf::from(path));
+        } else if let Some(path) = line.strip_prefix(JOIN) {
+            self.joining = Some(PathBuf::from(path));
+            self.receiving = false;
+            self.speed = 0;
         } else if let Some(progress) = line.strip_prefix(PROGRESS) {
             let fields: Vec<&str> = progress.split(' ').collect();
             let &[stage, status, downloaded, total, estimate, speed] = fields.as_slice() else {
@@ -434,6 +445,25 @@ impl Tracker {
         let downloaded = self.downloaded();
         Segment { start: 0, end: self.total().unwrap_or(downloaded), downloaded }
     }
+}
+
+/// How far joining `parts` bytes into `file` got. Joining copies the streams into a new
+/// container, so the file ends up about as large as the parts; it stops short of 1 until the
+/// download is done.
+pub(crate) fn joined_fraction(file: &Path, parts: u64) -> f64 {
+    let len = std::fs::metadata(file).map_or(0, |m| m.len());
+    if parts == 0 { 0.0 } else { (len as f64 / parts as f64).min(0.99) }
+}
+
+/// Where yt-dlp has ffmpeg write `path` while making it: `x.temp.mp4` for `x.mp4`.
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(".temp");
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    path.with_file_name(name)
 }
 
 /// yt-dlp prints `NA` for what it doesn't know, and some sizes as fractions.
@@ -550,18 +580,26 @@ async fn attempt(
             },
             _ = ticker.tick() => {
                 let now = Instant::now();
-                inner.emit(Event::Progress(Progress {
-                    id: record.id,
-                    downloaded: tracker.downloaded(),
-                    total: tracker.total(),
-                    speed: tracker.speed,
-                    connections: usize::from(tracker.receiving),
-                    planned: 1,
-                    refused: 0,
-                    idle: 0,
-                    stalled: tracker.receiving && now.duration_since(last_data) >= cfg.stall_after,
-                    problem: None,
-                    segments: vec![tracker.segment()],
+                inner.emit(Event::Progress(match &tracker.joining {
+                    Some(file) => {
+                        let parts = tracker.downloaded();
+                        Progress::joining(record.id, parts, joined_fraction(&temp_path(file), parts))
+                    }
+                    None => Progress {
+                        id: record.id,
+                        downloaded: tracker.downloaded(),
+                        total: tracker.total(),
+                        speed: tracker.speed,
+                        connections: usize::from(tracker.receiving),
+                        planned: 1,
+                        refused: 0,
+                        idle: 0,
+                        stalled: tracker.receiving
+                            && now.duration_since(last_data) >= cfg.stall_after,
+                        problem: None,
+                        segments: vec![tracker.segment()],
+                        joining: None,
+                    },
                 }));
                 if now.duration_since(last_checkpoint) >= cfg.checkpoint_interval {
                     last_checkpoint = now;
@@ -686,6 +724,24 @@ mod tests {
         assert_eq!(t.downloaded(), 700);
         t.line("BLAZER-FILE C:\\Videos\\clip.mp4");
         assert_eq!(t.file.as_deref(), Some(Path::new("C:\\Videos\\clip.mp4")));
+    }
+
+    #[test]
+    fn follows_the_join() {
+        let mut t = Tracker::default();
+        assert!(t.line("BLAZER-PROGRESS 137 downloading 100 700 NA 5000"));
+        t.line("BLAZER-JOIN clip.mkv");
+        assert_eq!(t.joining.as_deref(), Some(Path::new("clip.mkv")));
+        assert_eq!((t.receiving, t.speed), (false, 0));
+        assert_eq!(temp_path(Path::new("dir/clip.mkv")), Path::new("dir/clip.temp.mkv"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("clip.temp.mkv");
+        assert_eq!(joined_fraction(&file, 1000), 0.0);
+        std::fs::write(&file, [0; 250]).unwrap();
+        assert_eq!(joined_fraction(&file, 1000), 0.25);
+        std::fs::write(&file, [0; 1100]).unwrap();
+        assert_eq!(joined_fraction(&file, 1000), 0.99);
     }
 
     #[test]

@@ -15,6 +15,7 @@
   --paused: #9aa1ab;
   --danger: #d93838;
   --warn: #b7791f;
+  --joining: #2f6fdb;
   --shadow: 0 12px 40px rgb(0 0 0 / 0.18);
 
   color-scheme: light dark;
@@ -41,6 +42,7 @@
     --paused: #6d747e;
     --danger: #f05d5d;
     --warn: #e0a84a;
+    --joining: #5b9bff;
     --shadow: 0 12px 40px rgb(0 0 0 / 0.5);
   }
 }
@@ -526,6 +528,12 @@ main {
 }
 .progress.failed .label {
   color: var(--danger);
+}
+.progress.joining .fill {
+  background: var(--joining);
+}
+.progress.joining .label {
+  color: var(--joining);
 }
 .progress.retrying .fill,
 .progress.stalled .fill {

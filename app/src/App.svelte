@@ -28,6 +28,7 @@
     type Filter,
     FILTERS,
     inView,
+    listSize,
     percent,
     retryIn,
     STATUS_LABELS,
@@ -663,6 +664,7 @@ When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
       </div>
       {#each visible as item (item.id)}
         {@const pct = percent(item)}
+        {@const joining = item.status === "downloading" ? item.joining : null}
         {@const left = eta(item)}
         {@const tried = item.lastTryAt ?? item.completedAt}
         <!-- Keyboard selection is handled by the window shortcuts. -->
@@ -686,17 +688,22 @@ When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
               </span>
             {/if}
           </span>
-          <span class="muted">{item.total === null ? "—" : bytes(item.total)}</span>
+          <span class="muted">{listSize(item) === null ? "—" : bytes(listSize(item)!)}</span>
           <span
             class="progress {item.status}"
             class:stalled={item.status === "downloading" && item.stalled}
-            title={item.status === "downloading" ? (item.problem ?? undefined) : undefined}
+            class:joining={joining !== null}
+            title={joining !== null
+              ? "Putting the downloaded video and sound together into the finished file"
+              : item.status === "downloading" ? (item.problem ?? undefined) : undefined}
           >
             <span class="bar" class:indeterminate={pct === null && item.status === "downloading"}>
-              <span class="fill" style="width: {pct ?? 0}%"></span>
+              <span class="fill" style="width: {joining !== null ? joining * 100 : (pct ?? 0)}%"></span>
             </span>
             <span class="label">
-              {#if item.status === "downloading" && item.problem}
+              {#if joining !== null}
+                Joining… {(joining * 100).toFixed(0)}%
+              {:else if item.status === "downloading" && item.problem}
                 Reconnecting…
               {:else if item.status === "downloading" && item.stalled}
                 No data{pct === null ? "" : ` · ${pct.toFixed(1)}%`}

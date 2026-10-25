@@ -277,6 +277,7 @@ pub(crate) async fn execute(
                     stalled,
                     problem: if stalled { sh.trouble.lock().clone() } else { None },
                     segments: vec![Segment { start: 0, end: total.unwrap_or(done), downloaded: done }],
+                    joining: None,
                 }));
                 if now.duration_since(last_checkpoint) >= cfg.checkpoint_interval {
                     last_checkpoint = now;
@@ -567,9 +568,23 @@ async fn join(
     let done = match (remux, ffmpeg) {
         (true, Some(ffmpeg)) => {
             let temp = record.dir.join(format!("{stem}.temp.{ext}"));
-            let joined = tokio::select! {
-                joined = run_ffmpeg(ffmpeg, &parts, &temp, ext) => joined,
-                () = cancel.cancelled() => Ok(false),
+            let parts_len: u64 =
+                parts.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+            let mut ticker = time::interval(inner.config.progress_interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let joined = {
+                let run = run_ffmpeg(ffmpeg, &parts, &temp, ext);
+                tokio::pin!(run);
+                loop {
+                    tokio::select! {
+                        joined = &mut run => break joined,
+                        () = cancel.cancelled() => break Ok(false),
+                        _ = ticker.tick() => {
+                            let fraction = media::joined_fraction(&temp, parts_len);
+                            inner.emit(Event::Progress(Progress::joining(record.id, parts_len, fraction)));
+                        }
+                    }
+                }
             };
             match joined {
                 Ok(true) => temp,

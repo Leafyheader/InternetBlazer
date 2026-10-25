@@ -92,7 +92,9 @@
     <dt>Status</dt>
     <dd>
       {STATUS_LABELS[item.status]}
-      {#if item.status === "downloading" && item.problem}
+      {#if item.status === "downloading" && item.joining !== null}
+        · joining the video and sound
+      {:else if item.status === "downloading" && item.problem}
         · <span class="warn">reconnecting</span>
       {:else if item.status === "downloading" && item.stalled}
         · <span class="warn">no data arriving</span>

@@ -88,6 +88,8 @@ export interface Progress {
   /** While stalled: why connections last failed, such as the network being down. */
   problem: string | null;
   segments: Segment[];
+  /** While a video's downloaded parts are put together into the finished file: how far, 0 to 1. */
+  joining: number | null;
 }
 
 /** What a link points to, found out before downloading it. */

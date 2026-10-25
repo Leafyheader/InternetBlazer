@@ -25,6 +25,8 @@ export interface Item extends DownloadRecord {
   stalled: boolean;
   /** While stalled: why connections last failed. */
   problem: string | null;
+  /** While a video's parts are put together into the finished file: how far, 0 to 1. */
+  joining: number | null;
 }
 
 export type Filter = "all" | "active" | "paused" | "completed" | "failed";
@@ -66,6 +68,7 @@ function toItem(record: DownloadRecord, previous?: Item): Item {
     idle: running ? (previous?.idle ?? 0) : 0,
     stalled: running && (previous?.stalled ?? false),
     problem: running ? (previous?.problem ?? null) : null,
+    joining: running ? (previous?.joining ?? null) : null,
   };
 }
 
@@ -143,6 +146,7 @@ class Downloads {
             item.stalled = event.stalled;
             item.problem = event.problem;
             item.segments = event.segments;
+            item.joining = event.joining;
             break;
           }
           case "statusChanged": {
@@ -158,6 +162,7 @@ class Downloads {
               item.idle = 0;
               item.stalled = false;
               item.problem = null;
+              item.joining = null;
             }
             // Picks up what changed besides the status, such as the size after a restart.
             this.refresh(event.id);
@@ -207,6 +212,15 @@ export function percent(item: Item): number | null {
   if (item.total === null) return null;
   if (item.total === 0) return 0;
   return Math.min(100, (item.downloaded * 100) / item.total);
+}
+
+/**
+ * The Size column: the size, or for a video still downloading, whose size is only a guess that
+ * moves with the bitrate, the bytes so far, which only go up. The guess shows in Details.
+ */
+export function listSize(item: Item): number | null {
+  if (item.media !== null && item.status !== "completed") return item.downloaded || null;
+  return item.total;
 }
 
 /** Seconds left, or null when unknown. */

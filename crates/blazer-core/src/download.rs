@@ -873,6 +873,7 @@ async fn report(
             stalled,
             problem: if stalled { shared.trouble.lock().clone() } else { None },
             segments: segments.clone(),
+            joining: None,
         }));
 
         if now.duration_since(last_checkpoint) >= cfg.checkpoint_interval {

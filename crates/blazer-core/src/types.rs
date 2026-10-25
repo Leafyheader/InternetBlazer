@@ -200,6 +200,29 @@ pub struct Progress {
     pub problem: Option<String>,
     /// Sorted by start offset.
     pub segments: Vec<Segment>,
+    /// While the downloaded parts of a video are put together into the finished file, how far
+    /// that got, from 0 to 1.
+    pub joining: Option<f64>,
+}
+
+impl Progress {
+    /// Joining `bytes` of downloaded parts into the finished file, `fraction` of the way.
+    pub(crate) fn joining(id: DownloadId, bytes: u64, fraction: f64) -> Self {
+        Self {
+            id,
+            downloaded: bytes,
+            total: Some(bytes),
+            speed: 0,
+            connections: 0,
+            planned: 1,
+            refused: 0,
+            idle: 0,
+            stalled: false,
+            problem: None,
+            segments: vec![Segment { start: 0, end: bytes, downloaded: bytes }],
+            joining: Some(fraction),
+        }
+    }
 }
 
 /// What a link points to, found out without downloading it.
