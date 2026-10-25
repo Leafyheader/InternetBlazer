@@ -340,7 +340,11 @@ async fn follow_all(
             match record.status {
                 Status::Completed => {
                     saved += 1;
-                    println!("[{id}] Saved {} ({})", record.path().display(), bytes(record.downloaded()));
+                    println!(
+                        "[{id}] Saved {} ({})",
+                        record.path().display(),
+                        bytes(record.downloaded())
+                    );
                 }
                 Status::Failed => {
                     failed += 1;

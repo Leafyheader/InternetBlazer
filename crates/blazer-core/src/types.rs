@@ -170,9 +170,13 @@ pub enum CheckState {
     Checking,
     Matched,
     /// The file is damaged, or isn't the one the hash belongs to.
-    Mismatched { actual: String },
+    Mismatched {
+        actual: String,
+    },
     /// The file couldn't be read, such as after it was moved or deleted outside the app.
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -23,8 +23,8 @@ use crate::{
     store::{RedbStore, Store},
     tools,
     types::{
-        self, CheckState, Checksum, DownloadId, DownloadRecord, Event, LinkInfo, MediaFormat, MediaInfo, MediaTools,
-        QueueId, Retry, Settings, Status, Tool,
+        self, CheckState, Checksum, DownloadId, DownloadRecord, Event, LinkInfo, MediaFormat,
+        MediaInfo, MediaTools, QueueId, Retry, Settings, Status, Tool,
     },
 };
 

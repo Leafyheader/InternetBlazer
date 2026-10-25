@@ -134,7 +134,11 @@ impl Finish {
         notify(
             app,
             &format!("{name} is done"),
-            format!("{who} {} in {} seconds unless you cancel.", action.describe(), COUNTDOWN.as_secs()),
+            format!(
+                "{who} {} in {} seconds unless you cancel.",
+                action.describe(),
+                COUNTDOWN.as_secs()
+            ),
         );
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -201,7 +205,9 @@ fn power(action: FinishAction) -> std::io::Result<()> {
             ],
         ),
         #[cfg(target_os = "macos")]
-        FinishAction::Shutdown => ("osascript", &["-e", "tell application \"System Events\" to shut down"]),
+        FinishAction::Shutdown => {
+            ("osascript", &["-e", "tell application \"System Events\" to shut down"])
+        }
         #[cfg(target_os = "macos")]
         FinishAction::Sleep => ("pmset", &["sleepnow"]),
         #[cfg(target_os = "macos")]

@@ -32,16 +32,16 @@ mod stream;
 mod tools;
 mod types;
 
+pub use checksum::parse_sha256;
 pub use engine::{Config, Engine, MAX_AUTO_RETRIES, MAX_CONNECTIONS, NewDownload};
 pub use error::{Error, Result};
 pub use limit::MIN_SPEED_LIMIT;
 pub use queue::{ALL_DAYS, Queue, Schedule};
 pub use segment::Segment;
 pub use store::{RedbStore, Store};
-pub use checksum::parse_sha256;
 pub use types::{
-    CheckState, Checksum, DownloadId, DownloadRecord, Event, LinkInfo, MediaChoice, MediaFormat, MediaInfo, MediaTools,
-    Progress, QueueId, Retry, Settings, Status, Tool, TrackProgress,
+    CheckState, Checksum, DownloadId, DownloadRecord, Event, LinkInfo, MediaChoice, MediaFormat,
+    MediaInfo, MediaTools, Progress, QueueId, Retry, Settings, Status, Tool, TrackProgress,
 };
 
 /// Bytes free for this user on the disk that would hold `path`, which need not exist yet.

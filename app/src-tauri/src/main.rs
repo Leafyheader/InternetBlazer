@@ -18,14 +18,14 @@ mod tray;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use futures_util::StreamExt;
 use blazer_core::{
-    CheckState, Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, MediaFormat, MediaInfo,
-    MediaTools, NewDownload, Queue, QueueId, Settings, Status, Tool,
+    CheckState, Config, DownloadId, DownloadRecord, Engine, Event, LinkInfo, MediaFormat,
+    MediaInfo, MediaTools, NewDownload, Queue, QueueId, Settings, Status, Tool,
 };
 use bridge::{Bridge, Incoming};
 use categories::{Category, CategoryInfo};
 use finish::{Finish, FinishAction};
+use futures_util::StreamExt;
 use prefs::{Prefs, PrefsStore};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent, ipc::Response};

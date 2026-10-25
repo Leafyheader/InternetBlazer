@@ -15,7 +15,10 @@ pub fn parse_sha256(text: &str) -> Option<String> {
 
 /// The file's SHA-256 in lowercase hex, or `None` if `cancel` fired first. Blocks while it reads
 /// the whole file.
-pub(crate) fn hash_file(path: &Path, cancel: &CancellationToken) -> std::io::Result<Option<String>> {
+pub(crate) fn hash_file(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> std::io::Result<Option<String>> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0; 1 << 20];
