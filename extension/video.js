@@ -87,20 +87,40 @@
     @keyframes spin { to { transform: rotate(360deg); } }
   `;
 
-  const ICON =
-    '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13h10"/></svg>';
+  /** An SVG element with `attrs`. Built without HTML strings, which store reviewers ask for. */
+  function svgEl(tag, attrs) {
+    const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, value);
+    return node;
+  }
+
+  function downloadIcon() {
+    const svg = svgEl("svg", {
+      viewBox: "0 0 16 16",
+      fill: "none",
+      stroke: "currentColor",
+      "stroke-width": "1.8",
+      "stroke-linecap": "round",
+      "stroke-linejoin": "round",
+      "aria-hidden": "true",
+    });
+    svg.append(svgEl("path", { d: "M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13h10" }));
+    return svg;
+  }
 
   function build() {
     host = document.createElement("internetblazer-video");
     const root = host.attachShadow({ mode: "closed" });
-    root.innerHTML = `<style>${STYLE}</style>
-      <div class="wrap">
-        <button class="open" type="button" title="Download with InternetBlazer">${ICON}Download video</button>
-        <div class="menu" role="menu" hidden></div>
-      </div>`;
-    const wrap = root.querySelector(".wrap");
-    button = root.querySelector(".open");
-    menu = root.querySelector(".menu");
+    const wrap = el("div", "wrap");
+    button = el("button", "open");
+    button.type = "button";
+    button.title = "Download with InternetBlazer";
+    button.append(downloadIcon(), "Download video");
+    menu = el("div", "menu");
+    menu.setAttribute("role", "menu");
+    menu.hidden = true;
+    wrap.append(button, menu);
+    root.append(el("style", null, STYLE), wrap);
     button.addEventListener("click", (e) => {
       e.stopPropagation();
       menuOpen ? closeMenu() : openMenu();

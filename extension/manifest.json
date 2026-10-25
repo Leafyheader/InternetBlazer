@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "InternetBlazer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sends downloads to the InternetBlazer download manager.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3UtODyZGqOxCb56dtcGQKclj4PaWmV2zJoL9V5k7OT9wjMGC+OIqkGS/5rcnIUvs9fMU8vGNYm4m7U1250whOVhelJP4iamQL+4wtEsw3RWNWlYKWZI1gVhJye4SBkaGYl7JiS7QkYE9EiZbjMHDuEkHYlyBxpTiooE4A7vFuwOiHrH6n/1oSUlauK59b0KXDlnH/PIza7dN/TJBp5ktQWCb2rElZQjNq1/bGFcnHDG/VDrSGDYT138E+0givXrj2AF5LD8ZyV7VP4dwMyRRYIbRT9XduBJmhBY8vxCLpwf1cVO1r+czOV7ABrOBbngWiFtMjP5+mTIS6OSrwFKWTQIDAQAB",
   "permissions": ["contextMenus", "cookies", "downloads", "nativeMessaging", "storage", "webRequest"],
@@ -21,9 +21,9 @@
   "action": {
     "default_title": "InternetBlazer",
     "default_popup": "popup.html",
-    "default_icon": { "16": "icons/32.png", "32": "icons/32.png" }
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png" }
   },
-  "icons": { "16": "icons/32.png", "32": "icons/32.png", "48": "icons/64.png", "128": "icons/128.png" },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
   "browser_specific_settings": {
     "gecko": { "id": "internetblazer@internetblazer.org", "strict_min_version": "128.0" }
   }

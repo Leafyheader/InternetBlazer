@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "blazer-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blazer-core",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "blazer-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "axum",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "blazer-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "internetblazer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blazer-core",
