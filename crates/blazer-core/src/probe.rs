@@ -1,7 +1,7 @@
 //! Discovering size, range support and validators before downloading.
 
 use reqwest::{
-    Client, RequestBuilder, StatusCode,
+    Client, RequestBuilder, Response, StatusCode,
     header::{self, HeaderMap},
 };
 
@@ -19,6 +19,8 @@ pub(crate) struct ProbeInfo {
     pub file_name: Option<String>,
     /// The server sent a web page, not a file.
     pub html: bool,
+    /// Where the file was found, after redirects.
+    pub url: Option<String>,
 }
 
 impl ProbeInfo {
@@ -46,11 +48,45 @@ pub(crate) async fn probe(
     headers: &[(String, String)],
 ) -> Result<ProbeInfo> {
     let resp = request(client, url, headers).header(header::RANGE, "bytes=0-0").send().await?;
+    info(&resp)
+}
+
+/// Like [`probe`], but asks for the whole file from its start and returns the response with its
+/// body unread, so that it can go on to become the download's first connection, as IDM does.
+///
+/// A server that answers `bytes=0-` with the whole file may still take other ranges, so such an
+/// answer is checked with [`probe`]. If ranges work, the open response is no use: a download in
+/// parts needs a response that says it is a part.
+pub(crate) async fn probe_open(
+    client: &Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<(ProbeInfo, Option<Response>)> {
+    let resp = request(client, url, headers).header(header::RANGE, "bytes=0-").send().await?;
+    let info = info(&resp)?;
+    if info.html {
+        return Ok((info, None));
+    }
+    match resp.status() {
+        StatusCode::PARTIAL_CONTENT if info.resumable => Ok((info, Some(resp))),
+        status if status.is_success() && status != StatusCode::PARTIAL_CONTENT => {
+            let checked = probe(client, url, headers).await?;
+            match checked.resumable {
+                true => Ok((checked, None)),
+                false => Ok((info, Some(resp))),
+            }
+        }
+        _ => Ok((info, None)),
+    }
+}
+
+fn info(resp: &Response) -> Result<ProbeInfo> {
     let h = resp.headers();
     let (total, resumable) = match resp.status() {
         StatusCode::PARTIAL_CONTENT => {
-            let total = content_range(h).and_then(|r| r.total);
-            (total, total.is_some())
+            let range = content_range(h);
+            let total = range.as_ref().and_then(|r| r.total);
+            (total, total.is_some() && range.and_then(|r| r.start) == Some(0))
         }
         // An empty file cannot satisfy `bytes=0-0`.
         StatusCode::RANGE_NOT_SATISFIABLE if content_range(h).and_then(|r| r.total) == Some(0) => {
@@ -73,6 +109,7 @@ pub(crate) async fn probe(
         last_modified: header_str(h, header::LAST_MODIFIED),
         file_name,
         html,
+        url: Some(resp.url().to_string()),
     })
 }
 

@@ -556,6 +556,15 @@ fn tools_dir() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join("tools"))
 }
 
+/// yt-dlp, deno and ffmpeg as the installer put them, from `scripts/fetch-tools.mjs`. A dev build
+/// uses the ones that script fetched into `src-tauri/tools`, if it was run.
+fn bundled_tools_dir(app: &AppHandle) -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        return Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools"));
+    }
+    app.path().resource_dir().ok().map(|dir| dir.join("tools"))
+}
+
 fn log_dir() -> anyhow::Result<PathBuf> {
     Ok(data_dir()?.join("logs"))
 }
@@ -707,11 +716,19 @@ fn main() {
             let db = db_path()?;
             app.manage(PrefsStore::open(data_dir()?.join("app.json")));
             app.manage(Finish::default());
-            let config = Config { tools_dir: Some(tools_dir()?), ..Config::default() };
+            let config = Config {
+                tools_dir: Some(tools_dir()?),
+                bundled_tools_dir: bundled_tools_dir(app.handle()),
+                ..Config::default()
+            };
             let engine =
                 Engine::open(&db, config).with_context(|| format!("opening {}", db.display()))?;
             forward_events(app.handle().clone(), &engine);
             tauri::async_runtime::spawn(engine.clone().run_scheduler());
+            // Updates install without yt-dlp, deno and ffmpeg, which only the full installer
+            // ships, so an install that never had them gets them now.
+            let tools = engine.clone();
+            tauri::async_runtime::spawn(async move { tools.fetch_missing_tools().await });
             // Picks up where the app left off when it quit or crashed.
             let resume = engine.clone();
             tauri::async_runtime::spawn(async move {

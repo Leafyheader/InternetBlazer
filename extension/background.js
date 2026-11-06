@@ -103,13 +103,14 @@ if (chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     const name = baseName(item.filename);
     shouldTake(item, name).then(async (take) => {
-      if (take) await stop(item);
-      try {
+      if (!take) {
         suggest();
-      } catch {
-        // Already cancelled.
+        return;
       }
-      if (take) handOver(item, name);
+      // A cancelled download takes no file name: suggesting one now only raises
+      // "Download must be in progress".
+      await stop(item);
+      handOver(item, name);
     });
     return true;
   });

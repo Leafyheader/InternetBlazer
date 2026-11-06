@@ -62,6 +62,12 @@ struct Server {
     inverted: AtomicBool,
     /// Holds back ranged responses for the file's start, other than the probe, this long.
     first_part_delay: Duration,
+    /// The `Range` header of every request, or "" for none.
+    ranges_asked: parking_lot::Mutex<Vec<String>>,
+    /// Requests to `/go`, which redirects to `/signed/{generation}`.
+    go_hits: AtomicUsize,
+    /// `/signed/{n}` answers 403 for an `n` below this, like a signed address that expired.
+    generation: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +112,9 @@ impl Server {
             stall_after: 0,
             inverted: AtomicBool::new(false),
             first_part_delay: Duration::ZERO,
+            ranges_asked: parking_lot::Mutex::default(),
+            go_hits: AtomicUsize::new(0),
+            generation: AtomicUsize::new(1),
         }
     }
 
@@ -115,6 +124,8 @@ impl Server {
         let app = Router::new()
             .route("/file.bin", get(serve))
             .route("/sample", get(serve))
+            .route("/go", get(go))
+            .route("/signed/{n}", get(signed))
             .with_state(server.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/file.bin", listener.local_addr().unwrap());
@@ -140,7 +151,31 @@ fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
     Some((start.parse().ok()?, end.parse().ok()))
 }
 
+/// Redirects to the current signed address, as GitHub's release links do.
+async fn go(State(server): State<Arc<Server>>) -> Response {
+    server.go_hits.fetch_add(1, Ordering::Relaxed);
+    let n = server.generation.load(Ordering::Relaxed);
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, format!("/signed/{n}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn signed(
+    State(server): State<Arc<Server>>,
+    axum::extract::Path(n): axum::extract::Path<usize>,
+    headers: HeaderMap,
+) -> Response {
+    if n < server.generation.load(Ordering::Relaxed) {
+        return Response::builder().status(StatusCode::FORBIDDEN).body(Body::empty()).unwrap();
+    }
+    serve(State(server), headers).await
+}
+
 async fn serve(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
+    let asked = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    server.ranges_asked.lock().push(asked.to_owned());
     let etag = server.etag.lock().clone();
     let len = server.data.len() as u64;
     let if_range_ok = headers.get(header::IF_RANGE).is_none_or(|v| v == etag.as_str());
@@ -283,6 +318,8 @@ fn config() -> Config {
         progress_interval: Duration::from_millis(20),
         checkpoint_interval: Duration::from_millis(50),
         write_buffer: 64 * 1024,
+        // Most tests count on the probe not carrying the file; the prefetch has its own.
+        prefetch: false,
         ..Config::default()
     }
 }
@@ -1211,4 +1248,125 @@ async fn checks_the_sha256_of_the_finished_file() {
     assert!(engine.set_sha256(id, Some("abc")).is_err());
     engine.set_sha256(id, None).unwrap();
     assert_eq!(engine.get(id).unwrap().checksum, None);
+}
+
+fn prefetching(dir: &Path) -> Engine {
+    Engine::open(dir.join("state.redb"), Config { prefetch: true, ..config() }).unwrap()
+}
+
+/// Requests for the file's start, other than the open-ended one that probed it.
+fn starts_asked_again(server: &Server) -> Vec<String> {
+    let asked = server.ranges_asked.lock();
+    asked.iter().filter(|r| r.starts_with("bytes=0-") && *r != "bytes=0-").cloned().collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_response_that_looked_at_a_link_starts_its_download() {
+    let (server, url) = Server::new(3 * 1024 * 1024 + 77).spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = prefetching(tmp.path());
+
+    let info = engine.inspect(&url, &[]).await.unwrap();
+    assert_eq!(info.total, Some(server.data.len() as u64));
+    assert!(info.resumable);
+    // The dialog is open for a moment while the file arrives.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_saved(tmp.path(), &server.data);
+    let asked = server.ranges_asked.lock().clone();
+    assert_eq!(asked.iter().filter(|r| *r == "bytes=0-").count(), 1, "{asked:?}");
+    assert!(starts_asked_again(&server).is_empty(), "{asked:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_added_directly_starts_with_its_probe() {
+    let (server, url) = Server::new(2 * 1024 * 1024).spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = prefetching(tmp.path());
+
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_saved(tmp.path(), &server.data);
+    assert!(starts_asked_again(&server).is_empty(), "{:?}", server.ranges_asked.lock());
+    assert!(record.segments.len() > 1, "the other connections still joined in");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_without_ranges_keeps_its_probe_as_the_only_connection() {
+    let mut server = Server::new(1024 * 1024);
+    server.ranges = false;
+    let (server, url) = server.spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = prefetching(tmp.path());
+
+    engine.inspect(&url, &[]).await.unwrap();
+    let id = engine.add(NewDownload::new(&url, tmp.path())).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_saved(tmp.path(), &server.data);
+    // The open probe, then the check for ranges; nothing more.
+    assert_eq!(server.ranges_asked.lock().len(), 2, "{:?}", server.ranges_asked.lock());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_speed_limit_skips_the_prefetch() {
+    let (server, url) = Server::new(512 * 1024).spawn().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = prefetching(tmp.path());
+
+    let mut new = NewDownload::new(&url, tmp.path());
+    new.speed_limit = Some(10 * 1024 * 1024);
+    let id = engine.add(new).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_saved(tmp.path(), &server.data);
+    assert!(!server.ranges_asked.lock().iter().any(|r| r == "bytes=0-"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_go_straight_to_where_the_link_redirects() {
+    let (server, url) = Server::new(2 * 1024 * 1024).spawn().await;
+    let link = url.replace("/file.bin", "/go");
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = prefetching(tmp.path());
+
+    let mut new = NewDownload::new(&link, tmp.path());
+    new.file_name = Some("file.bin".into());
+    let id = engine.add(new).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_saved(tmp.path(), &server.data);
+    assert!(record.segments.len() > 1);
+    // Only the probe went through the redirect.
+    assert_eq!(server.go_hits.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn goes_back_to_the_link_when_the_redirect_target_expires() {
+    let (server, url) = Server::new(2 * 1024 * 1024).spawn().await;
+    let link = url.replace("/file.bin", "/go");
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = prefetching(tmp.path());
+
+    engine.inspect(&link, &[]).await.unwrap();
+    // The address the link led to expires while the dialog is open. The response already
+    // arriving from it goes on; new connections are refused there.
+    server.generation.store(2, Ordering::Relaxed);
+    let mut new = NewDownload::new(&link, tmp.path());
+    new.file_name = Some("file.bin".into());
+    let id = engine.add(new).await.unwrap();
+    let record = settle(&engine, id).await;
+
+    assert_eq!(record.status, Status::Completed, "{:?}", record.error);
+    assert_saved(tmp.path(), &server.data);
+    // The probe, then the link again for the new address, once for each connection refused.
+    assert!(server.go_hits.load(Ordering::Relaxed) >= 2);
 }

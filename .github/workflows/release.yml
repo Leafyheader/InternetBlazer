@@ -1,7 +1,8 @@
 name: Release
 
-# Pushing a tag such as v0.2.0 builds the installer and drafts a release with it. Publishing the
-# draft makes it the update that installed copies pick up.
+# Pushing a tag such as v0.2.0 builds the full installer and the smaller update installer, and
+# drafts a release with both and latest.json. Publishing the draft makes it the update that
+# installed copies pick up.
 on:
   push:
     tags: ["v*"]
@@ -22,15 +23,36 @@ jobs:
           cache-dependency-path: app/package-lock.json
       - run: npm ci
         working-directory: app
-      - uses: tauri-apps/tauri-action@v0
+      # The update: the app without yt-dlp, deno and ffmpeg, which installed copies keep. Each
+      # update stays small; the app fetches any tool an install is missing.
+      - name: Build the update
+        run: npm run package:update
+        working-directory: app
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: app
-          args: --config src-tauri/tauri.release.conf.json
-          tagName: ${{ github.ref_name }}
-          releaseName: InternetBlazer ${{ github.ref_name }}
-          releaseBody: See the commits since the last release for what changed.
-          releaseDraft: true
+      - name: Keep the update aside
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+          for ext in "" ".sig"; do
+            mv "target/release/bundle/nsis/InternetBlazer_${v}_x64-setup.exe$ext"               "release/InternetBlazer_${v}_x64-update.exe$ext"
+          done
+      # The installer people download: the app with yt-dlp, deno and ffmpeg, so videos work
+      # without fetching anything.
+      - name: Build the installer
+        run: npm run package
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - name: Point latest.json at the update
+        run: node app/scripts/latest-json.mjs "${{ github.ref_name }}" release
+      - name: Draft the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" --draft             --title "InternetBlazer $GITHUB_REF_NAME"             --notes "See the commits since the last release for what changed."             "target/release/bundle/nsis/InternetBlazer_${v}_x64-setup.exe"             "release/InternetBlazer_${v}_x64-update.exe"             release/latest.json

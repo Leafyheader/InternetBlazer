@@ -3,7 +3,7 @@
   "productName": "InternetBlazer",
   "identifier": "org.internetblazer.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run dev:host && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"

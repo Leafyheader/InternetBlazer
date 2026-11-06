@@ -1,10 +1,10 @@
-//! Finding the programs media downloads use, yt-dlp, deno and ffmpeg, and installing yt-dlp and
-//! deno.
+//! Finding the programs media downloads use, yt-dlp, deno and ffmpeg, and installing them.
 //!
-//! Each is looked for in the engine's tools folder first, then on `PATH`. yt-dlp is installed by
-//! the engine since it needs updating whenever sites change, and deno on request: yt-dlp runs
-//! YouTube's JavaScript with it, without which some formats are missing. ffmpeg is large and
-//! usually comes from the system's package manager.
+//! Each is looked for in the engine's tools folder first, then among the copies the app was
+//! installed with, then on `PATH`. yt-dlp is installed by the engine since it needs updating
+//! whenever sites change, and deno on request: yt-dlp runs YouTube's JavaScript with it, without
+//! which some formats are missing. An update goes into the tools folder, so it takes over from
+//! the installed copy, whose folder may not be writable.
 //!
 //! A program that comes as a folder is unpacked into a folder named after its checksum, and
 //! `<name>.current` names the one in use. A new version goes into a new folder, since Windows
@@ -72,9 +72,40 @@ const DENO_ASSET: Option<&str> = if cfg!(all(windows, target_arch = "x86_64")) {
 };
 const DENO_RELEASE: &str = "https://github.com/denoland/deno/releases/latest/download/";
 
-/// yt-dlp, and whether it is the copy in `dir` that [`install_ytdlp`] manages.
-pub(crate) fn ytdlp(dir: Option<&Path>) -> Option<(PathBuf, bool)> {
-    match current(dir, "yt-dlp", YTDLP).or_else(|| in_dir(dir, YTDLP)) {
+/// BtbN's ffmpeg builds for this system, if there are any to install. Their LGPL builds with
+/// shared libraries are used: ffmpeg and ffprobe load one set of DLLs, where each static program
+/// holds its own copy, and the LGPL lets the app pass them on.
+const FFMPEG_BUILD: Option<&str> = if cfg!(all(windows, target_arch = "x86_64")) {
+    Some("win64")
+} else if cfg!(all(windows, target_arch = "aarch64")) {
+    Some("winarm64")
+} else {
+    None
+};
+const FFMPEG_RELEASE: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest";
+
+/// Where the programs are looked for before `PATH`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Dirs<'a> {
+    /// The engine's own folder, which [`install_ytdlp`] and [`install_deno`] update.
+    pub own: Option<&'a Path>,
+    /// The copies installed with the app, as `<tool>/<program>`. Never written to.
+    pub bundled: Option<&'a Path>,
+}
+
+impl Dirs<'_> {
+    fn bundled(&self, tool: &str, program: &str) -> Option<PathBuf> {
+        self.bundled.map(|dir| dir.join(tool).join(program)).filter(|path| path.is_file())
+    }
+}
+
+/// yt-dlp, and whether it is the app's own copy, which [`install_ytdlp`] can update.
+pub(crate) fn ytdlp(dirs: Dirs) -> Option<(PathBuf, bool)> {
+    let dir = dirs.own;
+    match current(dir, "yt-dlp", YTDLP)
+        .or_else(|| in_dir(dir, YTDLP))
+        .or_else(|| dirs.bundled("yt-dlp", YTDLP))
+    {
         Some(path) => Some((path, true)),
         None => on_path(YTDLP).map(|path| (path, false)),
     }
@@ -87,19 +118,19 @@ pub(crate) fn ytdlp_is_single_file(dir: Option<&Path>) -> bool {
         && in_dir(dir, YTDLP).is_some()
 }
 
-/// deno, and whether it is the copy in `dir` that [`install_deno`] manages.
-pub(crate) fn deno(dir: Option<&Path>) -> Option<(PathBuf, bool)> {
-    match current(dir, "deno", DENO) {
+/// deno, and whether it is the app's own copy, which [`install_deno`] can update.
+pub(crate) fn deno(dirs: Dirs) -> Option<(PathBuf, bool)> {
+    match current(dirs.own, "deno", DENO).or_else(|| dirs.bundled("deno", DENO)) {
         Some(path) => Some((path, true)),
         None => on_path(DENO).map(|path| (path, false)),
     }
 }
 
 /// Starts a yt-dlp command, with deno for YouTube's JavaScript when there is one.
-pub(crate) fn ytdlp_command(ytdlp: &Path, dir: Option<&Path>) -> Command {
+pub(crate) fn ytdlp_command(ytdlp: &Path, dirs: Dirs) -> Command {
     let mut cmd = Command::new(ytdlp);
     cmd.env("PYTHONUTF8", "1");
-    if let Some((deno, _)) = deno(dir) {
+    if let Some((deno, _)) = deno(dirs) {
         let mut runtime = std::ffi::OsString::from("deno:");
         runtime.push(deno);
         cmd.arg("--js-runtimes").arg(runtime);
@@ -119,8 +150,21 @@ fn current(dir: Option<&Path>, tool: &str, program: &str) -> Option<PathBuf> {
     Some(dir.join(folder).join(program)).filter(|path| path.is_file())
 }
 
-pub(crate) fn ffmpeg(dir: Option<&Path>) -> Option<PathBuf> {
-    in_dir(dir, FFMPEG).or_else(|| on_path(FFMPEG))
+pub(crate) fn ffmpeg(dirs: Dirs) -> Option<PathBuf> {
+    current(dirs.own, "ffmpeg", FFMPEG)
+        .or_else(|| in_dir(dirs.own, FFMPEG))
+        .or_else(|| dirs.bundled("ffmpeg", FFMPEG))
+        .or_else(|| on_path(FFMPEG))
+}
+
+/// Whether [`install_deno`] has a build for this system.
+pub(crate) fn can_install_deno() -> bool {
+    DENO_ASSET.is_some()
+}
+
+/// Whether [`install_ffmpeg`] has a build for this system.
+pub(crate) fn can_install_ffmpeg() -> bool {
+    FFMPEG_BUILD.is_some()
 }
 
 fn in_dir(dir: Option<&Path>, name: &str) -> Option<PathBuf> {
@@ -239,7 +283,7 @@ pub(crate) async fn install_ytdlp(client: &reqwest::Client, dir: &Path) -> Resul
             Error::Invalid(format!("the yt-dlp release does not list a checksum for {asset}"))
         })?;
         let zip = fetch(client, &format!("{RELEASE}{asset}")).await?;
-        let path = unpack_checked(dir, "yt-dlp", YTDLP, zip, &expected).await?;
+        let path = unpack_checked(dir, "yt-dlp", YTDLP, zip, &expected, as_is).await?;
         // The single file it replaces, if this is the first folder build.
         for old in [YTDLP.to_string(), format!("{YTDLP}.old")] {
             let _ = std::fs::remove_file(dir.join(old));
@@ -297,17 +341,85 @@ pub(crate) async fn install_deno(client: &reqwest::Client, dir: &Path) -> Result
         Error::Invalid(format!("could not read the checksum published for {asset}"))
     })?;
     let zip = fetch(client, &format!("{DENO_RELEASE}{asset}")).await?;
-    unpack_checked(dir, "deno", DENO, zip, &expected).await
+    unpack_checked(dir, "deno", DENO, zip, &expected, as_is).await
+}
+
+/// Downloads ffmpeg and ffprobe of the newest FFmpeg release into `dir`, checked against the
+/// checksums published with them.
+pub(crate) async fn install_ffmpeg(client: &reqwest::Client, dir: &Path) -> Result<PathBuf> {
+    let build = FFMPEG_BUILD.ok_or_else(|| {
+        Error::Invalid("there is no ffmpeg build to install for this system".into())
+    })?;
+    // GitHub's API turns away requests that don't name their program.
+    let agent = [(
+        "User-Agent".to_string(),
+        concat!("InternetBlazer/", env!("CARGO_PKG_VERSION")).to_string(),
+    )];
+    let resp = probe::request(client, FFMPEG_RELEASE, &agent).send().await?;
+    if !resp.status().is_success() {
+        return Err(Error::from_response(resp.status(), resp.headers()));
+    }
+    let release: serde_json::Value = serde_json::from_slice(&resp.bytes().await?)
+        .map_err(|e| Error::Invalid(format!("could not read the list of ffmpeg builds: {e}")))?;
+    let assets: Vec<(&str, &str)> = release["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| Some((a["name"].as_str()?, a["browser_download_url"].as_str()?)))
+        .collect();
+    let missing = || Error::Invalid("the ffmpeg builds have no LGPL build for this system".into());
+    let (name, url) = newest_ffmpeg(&assets, build).ok_or_else(missing)?;
+    let (_, sums) = assets.iter().find(|(n, _)| *n == "checksums.sha256").ok_or_else(missing)?;
+    let sums = fetch(client, sums).await?;
+    let expected = expected_hash(&String::from_utf8_lossy(&sums), name).ok_or_else(|| {
+        Error::Invalid(format!("the ffmpeg builds do not list a checksum for {name}"))
+    })?;
+    let zip = fetch(client, url).await?;
+    unpack_checked(dir, "ffmpeg", FFMPEG, zip, &expected, ffmpeg_file).await
+}
+
+/// The LGPL build with shared libraries of the newest release branch, as in
+/// `ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip`, from `(name, url)` pairs.
+fn newest_ffmpeg<'a>(assets: &[(&'a str, &'a str)], build: &str) -> Option<(&'a str, &'a str)> {
+    let version = |name: &str| -> Option<Vec<u32>> {
+        let (version, rest) = name.strip_prefix("ffmpeg-n")?.split_once("-latest-")?;
+        let rest = rest.strip_prefix(build)?.strip_prefix("-lgpl-shared-")?;
+        rest.strip_suffix(".zip")?;
+        version.split('.').map(|n| n.parse().ok()).collect()
+    };
+    assets
+        .iter()
+        .filter_map(|&(name, url)| Some((version(name)?, name, url)))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, name, url)| (name, url))
+}
+
+/// Where a file of an ffmpeg build goes: the programs and their DLLs from `<top>/bin`, without
+/// the player, and the license.
+fn ffmpeg_file(path: &Path) -> Option<PathBuf> {
+    let parts: Vec<_> = path.iter().skip(1).collect();
+    match parts.as_slice() {
+        [bin, file] if *bin == "bin" && *file != "ffplay.exe" => Some(PathBuf::from(file)),
+        [license] if *license == "LICENSE.txt" => Some(PathBuf::from(license)),
+        _ => None,
+    }
+}
+
+/// Every file of a download, where it is in the zip.
+fn as_is(path: &Path) -> Option<PathBuf> {
+    Some(path.to_path_buf())
 }
 
 /// Checks `zip` against `expected` and unpacks it into a new folder for `tool` in `dir`, which
-/// becomes the current one. Returns the path of `program` in it.
+/// becomes the current one. `place` says where each file of the zip goes in the folder, if
+/// anywhere. Returns the path of `program` in it.
 async fn unpack_checked(
     dir: &Path,
     tool: &str,
     program: &str,
     zip: Vec<u8>,
     expected: &str,
+    place: fn(&Path) -> Option<PathBuf>,
 ) -> Result<PathBuf> {
     let actual = hex(&Sha256::digest(&zip));
     if actual != expected {
@@ -316,12 +428,19 @@ async fn unpack_checked(
         )));
     }
     let (dir, tool, program) = (dir.to_path_buf(), tool.to_string(), program.to_string());
-    tokio::task::spawn_blocking(move || unpack(&dir, &tool, &program, &zip, &actual[..12]))
+    tokio::task::spawn_blocking(move || unpack(&dir, &tool, &program, &zip, &actual[..12], place))
         .await
         .map_err(Error::internal)?
 }
 
-fn unpack(dir: &Path, tool: &str, program: &str, zip: &[u8], id: &str) -> Result<PathBuf> {
+fn unpack(
+    dir: &Path,
+    tool: &str,
+    program: &str,
+    zip: &[u8],
+    id: &str,
+    place: fn(&Path) -> Option<PathBuf>,
+) -> Result<PathBuf> {
     let name = format!("{tool}-{id}");
     let folder = dir.join(&name);
     let path = folder.join(program);
@@ -335,7 +454,7 @@ fn unpack(dir: &Path, tool: &str, program: &str, zip: &[u8], id: &str) -> Result
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| Error::Invalid(e.to_string()))?;
             // Never a path outside the folder.
-            let Some(relative) = entry.enclosed_name() else { continue };
+            let Some(relative) = entry.enclosed_name().and_then(|p| place(&p)) else { continue };
             let target = partial.join(relative);
             if entry.is_dir() {
                 std::fs::create_dir_all(&target)?;
@@ -445,14 +564,14 @@ mod tests {
         zip.start_file("../escape.txt", options).unwrap();
         let bytes = zip.finish().unwrap().into_inner();
 
-        let path = unpack(dir.path(), "tool", "tool.exe", &bytes, "aaaaaaaaaaaa").unwrap();
+        let path = unpack(dir.path(), "tool", "tool.exe", &bytes, "aaaaaaaaaaaa", as_is).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"v1");
         assert_eq!(current(Some(dir.path()), "tool", "tool.exe"), Some(path));
         assert!(dir.path().join("tool-aaaaaaaaaaaa/_internal/lib.dll").is_file());
         assert!(!dir.path().parent().unwrap().join("escape.txt").exists());
 
         // A newer version replaces the pointer and the old folder.
-        let path = unpack(dir.path(), "tool", "tool.exe", &bytes, "bbbbbbbbbbbb").unwrap();
+        let path = unpack(dir.path(), "tool", "tool.exe", &bytes, "bbbbbbbbbbbb", as_is).unwrap();
         assert_eq!(current(Some(dir.path()), "tool", "tool.exe"), Some(path));
         assert!(!dir.path().join("tool-aaaaaaaaaaaa").exists());
     }
@@ -460,15 +579,69 @@ mod tests {
     /// Installs yt-dlp and deno from their releases into a temporary folder and runs them. Run
     /// with `cargo test -- --ignored`.
     #[tokio::test]
-    #[ignore = "needs the network and downloads about 60 MB"]
-    async fn installs_ytdlp_and_deno() {
+    #[ignore = "needs the network and downloads about 110 MB"]
+    async fn installs_ytdlp_deno_and_ffmpeg() {
         let dir = tempfile::tempdir().unwrap();
         let client = reqwest::Client::new();
         let ytdlp = install_ytdlp(&client, dir.path()).await.unwrap();
-        assert_eq!(self::ytdlp(Some(dir.path())).unwrap(), (ytdlp.clone(), true));
+        let own = Dirs { own: Some(dir.path()), bundled: None };
+        assert_eq!(self::ytdlp(own).unwrap(), (ytdlp.clone(), true));
         assert!(!ytdlp_is_single_file(Some(dir.path())));
         let deno = install_deno(&client, dir.path()).await.unwrap();
         println!("{} / {}", version(&ytdlp).await.unwrap(), version(&deno).await.unwrap());
+        if can_install_ffmpeg() {
+            let ffmpeg = install_ffmpeg(&client, dir.path()).await.unwrap();
+            assert_eq!(self::ffmpeg(own), Some(ffmpeg.clone()));
+            assert!(ffmpeg.with_file_name("ffprobe.exe").is_file());
+            assert!(!ffmpeg.with_file_name("ffplay.exe").exists());
+            let mut cmd = Command::new(&ffmpeg);
+            let output = cmd.arg("-version").output().await.unwrap();
+            assert!(output.status.success(), "the DLLs it needs are beside it");
+        }
+    }
+
+    #[test]
+    fn picks_the_newest_lgpl_ffmpeg_for_the_system() {
+        let assets = [
+            ("checksums.sha256", "sums"),
+            ("ffmpeg-master-latest-win64-lgpl-shared.zip", "master"),
+            ("ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip", "8.1"),
+            ("ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip", "9.0"),
+            ("ffmpeg-n10.0-latest-win64-gpl-shared-10.0.zip", "gpl"),
+            ("ffmpeg-n10.0-latest-winarm64-lgpl-shared-10.0.zip", "arm"),
+            ("ffmpeg-n9.1-latest-win64-lgpl-9.1.zip", "static"),
+        ];
+        assert_eq!(newest_ffmpeg(&assets, "win64").map(|(_, url)| url), Some("9.0"));
+        assert_eq!(newest_ffmpeg(&assets, "winarm64").map(|(_, url)| url), Some("arm"));
+        assert_eq!(newest_ffmpeg(&assets, "linux64"), None);
+    }
+
+    #[test]
+    fn keeps_the_programs_and_license_of_an_ffmpeg_build() {
+        let top = "ffmpeg-n9.0-latest-win64-lgpl-shared-9.0";
+        let place = |p: &str| ffmpeg_file(Path::new(&format!("{top}/{p}")));
+        assert_eq!(place("bin/ffmpeg.exe"), Some(PathBuf::from("ffmpeg.exe")));
+        assert_eq!(place("bin/avcodec-63.dll"), Some(PathBuf::from("avcodec-63.dll")));
+        assert_eq!(place("LICENSE.txt"), Some(PathBuf::from("LICENSE.txt")));
+        assert_eq!(place("bin/ffplay.exe"), None);
+        assert_eq!(place("include/libavcodec/avcodec.h"), None);
+        assert_eq!(place("doc/ffmpeg.html"), None);
+    }
+
+    #[test]
+    fn an_update_takes_over_from_the_installed_copy() {
+        let bundled = tempfile::tempdir().unwrap();
+        let own = tempfile::tempdir().unwrap();
+        let installed = bundled.path().join("yt-dlp").join(YTDLP);
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, b"").unwrap();
+        let dirs = Dirs { own: Some(own.path()), bundled: Some(bundled.path()) };
+        // The installed copy counts as the app's own, so the app offers to update it.
+        assert_eq!(ytdlp(dirs).unwrap(), (installed, true));
+
+        let updated = own.path().join(YTDLP);
+        std::fs::write(&updated, b"").unwrap();
+        assert_eq!(ytdlp(dirs).unwrap(), (updated, true));
     }
 
     #[test]

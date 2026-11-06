@@ -41,6 +41,7 @@ use crate::{
     limit::RateLimiter,
     media, playlist, probe,
     segment::Segment,
+    speed::SpeedMeter,
     tools,
     types::{self, DownloadRecord, Event, Progress, Status, TrackProgress},
 };
@@ -49,7 +50,6 @@ use crate::{
 const MAX_PIECE: u64 = 256 * 1024 * 1024;
 /// How many pieces per connection may be fetched ahead of the first one not yet written.
 const AHEAD_PER_CONNECTION: usize = 2;
-const SPEED_SMOOTHING: f64 = 0.3;
 const MAX_BACKOFF_SHIFT: u32 = 5;
 
 /// One stream to download in full: the picture (with its sound, unless that comes apart), or the
@@ -158,7 +158,7 @@ pub(crate) async fn execute(
         tracks = playlist::tracks(&inner.client, &url, &record.headers, format) => tracks?,
         () = cancel.cancelled() => return Ok(false),
     };
-    let ffmpeg = tools::ffmpeg(inner.config.tools_dir.as_deref());
+    let ffmpeg = tools::ffmpeg(inner.config.tool_dirs());
     if tracks.len() > 1 && ffmpeg.is_none() {
         return Err(Error::Media {
             message: "This video needs ffmpeg to join its picture and sound. Install ffmpeg (on \
@@ -226,8 +226,7 @@ pub(crate) async fn execute(
     let mut ticker = time::interval(cfg.progress_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_checkpoint = Instant::now();
-    let mut last_sample = (Instant::now(), downloaded(&sh));
-    let mut speed = 0.0;
+    let mut meter = SpeedMeter::new(Instant::now(), sh.received.load(Ordering::Relaxed));
     let (mut received, mut last_data) = (0, Instant::now());
     let mut failure = None;
     loop {
@@ -248,16 +247,8 @@ pub(crate) async fn execute(
             _ = ticker.tick() => {
                 let now = Instant::now();
                 let done = downloaded(&sh);
-                let elapsed = now.duration_since(last_sample.0).as_secs_f64();
-                if elapsed > 0.0 {
-                    let sample = done.saturating_sub(last_sample.1) as f64 / elapsed;
-                    speed = match speed == 0.0 {
-                        true => sample,
-                        false => SPEED_SMOOTHING * sample + (1.0 - SPEED_SMOOTHING) * speed,
-                    };
-                }
-                last_sample = (now, done);
                 let now_received = sh.received.load(Ordering::Relaxed);
+                let speed = meter.sample(now, now_received);
                 if now_received != received || sh.throttled.load(Ordering::Relaxed) > 0 {
                     received = now_received;
                     last_data = now;
@@ -269,7 +260,7 @@ pub(crate) async fn execute(
                     id: record.id,
                     downloaded: done,
                     total,
-                    speed: speed as u64,
+                    speed,
                     connections: sh.connections.load(Ordering::Relaxed),
                     planned: worker_count,
                     refused: 0,

@@ -18,7 +18,9 @@ use crate::{
     error::{Error, Result},
     filename, fsio,
     limit::{self, RateLimiter},
-    media, playlist, probe,
+    media, playlist,
+    prefetch::{Prefetch, Prefetches},
+    probe,
     queue::{self, Queue},
     store::{RedbStore, Store},
     tools,
@@ -63,9 +65,21 @@ pub struct Config {
     /// How often progress is flushed to disk and saved to the store.
     pub checkpoint_interval: Duration,
     pub user_agent: String,
+    /// Keep the response that probed a link arriving, as the download's first connection, as
+    /// IDM does: see `prefetch.rs`.
+    pub prefetch: bool,
     /// Where [`Engine::install_ytdlp`] puts yt-dlp, and where yt-dlp and ffmpeg are looked for
     /// before `PATH`. Without it, yt-dlp cannot be installed.
     pub tools_dir: Option<PathBuf>,
+    /// yt-dlp, deno and ffmpeg as installed with the app, each in a folder of its name. Used when
+    /// `tools_dir` has no copy of its own; updates go to `tools_dir`.
+    pub bundled_tools_dir: Option<PathBuf>,
+}
+
+impl Config {
+    pub(crate) fn tool_dirs(&self) -> tools::Dirs<'_> {
+        tools::Dirs { own: self.tools_dir.as_deref(), bundled: self.bundled_tools_dir.as_deref() }
+    }
 }
 
 impl Default for Config {
@@ -84,9 +98,13 @@ impl Default for Config {
             stall_after: Duration::from_secs(3),
             write_buffer: 512 * 1024,
             progress_interval: Duration::from_millis(250),
-            checkpoint_interval: Duration::from_secs(1),
+            // Each checkpoint forces written data onto the disk, which can hold up writes for a
+            // moment. A crash loses at most this much progress, which is fetched again.
+            checkpoint_interval: Duration::from_secs(5),
             user_agent: concat!("InternetBlazer/", env!("CARGO_PKG_VERSION")).to_string(),
+            prefetch: true,
             tools_dir: None,
+            bundled_tools_dir: None,
         }
     }
 }
@@ -164,6 +182,8 @@ pub(crate) struct Inner {
     adding: Mutex<()>,
     /// Pages yt-dlp recently looked at, newest last.
     media_cache: Mutex<Vec<FoundMedia>>,
+    /// Files already arriving for links that were looked at or added, but have not started.
+    pub(crate) prefetches: Mutex<Prefetches>,
 }
 
 /// What yt-dlp found on a page.
@@ -444,7 +464,11 @@ impl Engine {
         }
         let settings = store.settings()?;
         let speed_limit = RateLimiter::new(settings.speed_limit);
+        // HTTP/2 would carry every connection of a download over one TCP connection, so a lost
+        // packet or a per-connection speed cap on the server slows them all at once. Over
+        // HTTP/1.1 each connection gets its own socket, which is what makes several faster.
         let client = reqwest::Client::builder()
+            .http1_only()
             .user_agent(&config.user_agent)
             .connect_timeout(config.connect_timeout)
             .read_timeout(config.read_timeout)
@@ -467,6 +491,7 @@ impl Engine {
                 held: Mutex::default(),
                 adding: Mutex::default(),
                 media_cache: Mutex::default(),
+                prefetches: Mutex::default(),
             }),
         })
     }
@@ -488,15 +513,22 @@ impl Engine {
     }
 
     /// Finds out what a link points to, such as its size, without adding a download.
+    ///
+    /// The file goes on arriving in the background for a few minutes, as IDM does, so that a
+    /// download added for it soon after starts with data in hand: see `prefetch.rs`.
     pub async fn inspect(&self, url: &str, headers: &[(String, String)]) -> Result<LinkInfo> {
         let url = parse_url(url)?;
-        let info = probe::probe(&self.inner.client, url.as_str(), headers).await?;
-        Ok(LinkInfo {
-            file_name: info.file_name.map(|name| filename::sanitize(&name)),
-            total: info.total,
-            resumable: info.resumable,
-            page: info.html,
-        })
+        if !self.inner.config.prefetch {
+            let info = probe::probe(&self.inner.client, url.as_str(), headers).await?;
+            return Ok(link_info(info));
+        }
+        let (info, resp) = probe::probe_open(&self.inner.client, url.as_str(), headers).await?;
+        // Under a speed limit, data fetched ahead would be data fetched past the limit.
+        if let Some(resp) = resp.filter(|_| self.inner.speed_limit.limit().is_none()) {
+            let prefetch = Prefetch::start(url.to_string(), headers.to_vec(), info.clone(), resp);
+            self.inner.prefetches.lock().keep(prefetch);
+        }
+        Ok(link_info(info))
     }
 
     /// Finds the videos or sounds yt-dlp can download from the page at `url`. An HLS or DASH
@@ -527,8 +559,7 @@ impl Engine {
         stream: bool,
     ) -> Result<MediaInfo> {
         let url = parse_url(url)?;
-        let dir = self.inner.config.tools_dir.as_deref();
-        let ffmpeg = tools::ffmpeg(dir).is_some();
+        let ffmpeg = tools::ffmpeg(self.inner.config.tool_dirs()).is_some();
         if let Some(found) = self.found_media(url.as_str(), ffmpeg) {
             return Ok(found.0);
         }
@@ -566,7 +597,7 @@ impl Engine {
         ffmpeg: bool,
         without_cookies: &mut bool,
     ) -> Result<MediaInfo> {
-        let dir = self.inner.config.tools_dir.as_deref();
+        let dir = self.inner.config.tool_dirs();
         let (ytdlp, _) = tools::ytdlp(dir).ok_or(Error::NoYtdlp)?;
         match media::inspect(&ytdlp, dir, ffmpeg, url.as_str(), headers).await {
             // Signed in, YouTube serves yt-dlp in ways it can only read with a JavaScript
@@ -597,7 +628,7 @@ impl Engine {
 
     /// The yt-dlp, deno and ffmpeg that media downloads would use.
     pub async fn media_tools(&self) -> MediaTools {
-        let dir = self.inner.config.tools_dir.as_deref();
+        let dir = self.inner.config.tool_dirs();
         let (ytdlp, deno) = tokio::join!(tool(tools::ytdlp(dir)), tool(tools::deno(dir)));
         MediaTools { ytdlp, deno, ffmpeg: tools::ffmpeg(dir) }
     }
@@ -633,6 +664,30 @@ impl Engine {
         Ok(Tool { path, version: short_version(&version), managed: true })
     }
 
+    /// Fetches whichever of yt-dlp, deno and ffmpeg can't be found into [`Config::tools_dir`]:
+    /// for an install without them, such as one updated from a version that didn't ship them,
+    /// or one whose copy was deleted. Each is tried again next time after a failure, such as
+    /// being offline.
+    pub async fn fetch_missing_tools(&self) {
+        let Some(dir) = self.inner.config.tools_dir.as_deref() else { return };
+        let dirs = self.inner.config.tool_dirs();
+        let client = &self.inner.client;
+        let _installing = self.inner.installing.lock().await;
+        let report = |tool: &str, result: Result<PathBuf>| match result {
+            Ok(path) => tracing::info!("fetched {tool}, which was missing: {}", path.display()),
+            Err(e) => tracing::warn!("fetching {tool}, which is missing: {e}"),
+        };
+        if tools::ytdlp(dirs).is_none() {
+            report("yt-dlp", tools::install_ytdlp(client, dir).await);
+        }
+        if tools::can_install_deno() && tools::deno(dirs).is_none() {
+            report("deno", tools::install_deno(client, dir).await);
+        }
+        if tools::can_install_ffmpeg() && tools::ffmpeg(dirs).is_none() {
+            report("ffmpeg", tools::install_ffmpeg(client, dir).await);
+        }
+    }
+
     /// Probes the URL, picks a unique file name and records the download.
     pub async fn add(&self, mut new: NewDownload) -> Result<DownloadId> {
         let queue = new.queue.unwrap_or(QueueId::MAIN);
@@ -640,15 +695,46 @@ impl Engine {
         let url = parse_url(&new.url)?;
         let sha256 = new.sha256.as_deref().map(parse_checksum).transpose()?;
         if new.media.is_some() {
-            let ffmpeg = tools::ffmpeg(self.inner.config.tools_dir.as_deref()).is_some();
+            let ffmpeg = tools::ffmpeg(self.inner.config.tool_dirs()).is_some();
             if let Some((_, true)) = self.found_media(url.as_str(), ffmpeg) {
                 new.headers.retain(|h| !is_cookie(h));
             }
         }
+        // A download that starts now and may go as fast as it can keeps the response that
+        // probed it as its first connection; see `prefetch.rs`.
+        let prefetch = self.inner.config.prefetch
+            && new.start
+            && new.speed_limit.is_none()
+            && self.inner.speed_limit.limit().is_none();
+        let mut early = None;
         let info = match new.media {
             // yt-dlp finds the file each time it runs; there is nothing to probe.
             Some(_) => probe::ProbeInfo { resumable: true, ..Default::default() },
-            None => probe::probe(&self.inner.client, url.as_str(), &new.headers).await?,
+            None => {
+                let looked = self.inner.prefetches.lock().take_link(url.as_str(), &new.headers);
+                match looked {
+                    Some(p) => {
+                        let info = p.info.clone();
+                        early = prefetch.then_some(p);
+                        info
+                    }
+                    None if prefetch => {
+                        let client = &self.inner.client;
+                        let (info, resp) =
+                            probe::probe_open(client, url.as_str(), &new.headers).await?;
+                        early = resp.map(|resp| {
+                            Prefetch::start(
+                                url.to_string(),
+                                new.headers.clone(),
+                                info.clone(),
+                                resp,
+                            )
+                        });
+                        info
+                    }
+                    None => probe::probe(&self.inner.client, url.as_str(), &new.headers).await?,
+                }
+            }
         };
 
         let name = match (new.media, new.file_name.as_deref()) {
@@ -661,7 +747,7 @@ impl Engine {
         };
         // A playlist the engine read itself, rather than a page yt-dlp looked at.
         let stream = new.media.is_some() && {
-            let ffmpeg = tools::ffmpeg(self.inner.config.tools_dir.as_deref()).is_some();
+            let ffmpeg = tools::ffmpeg(self.inner.config.tool_dirs()).is_some();
             match self.found_media(url.as_str(), ffmpeg) {
                 Some((found, _)) => matches!(found.site.as_str(), "HLS" | "DASH"),
                 None => playlist::looks_like_playlist(&url),
@@ -719,6 +805,9 @@ impl Engine {
         };
         self.inner.store.save(&record)?;
         drop(adding);
+        if let Some(early) = early {
+            self.inner.prefetches.lock().attach(id, early);
+        }
         self.inner.emit(Event::Added(record));
         if new.start {
             self.inner.dispatch();
@@ -957,6 +1046,8 @@ impl Engine {
         self.pause(id);
         let record = self.wait(id).await?;
         self.inner.store.delete(id)?;
+        // Closes the connection of a download removed before it started.
+        drop(self.inner.prefetches.lock().take_download(id));
         if delete_files {
             for path in media::working_files(&record) {
                 remove_if_exists(&path)?;
@@ -1288,5 +1379,14 @@ fn remove_if_exists(path: &std::path::Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(()),
+    }
+}
+
+fn link_info(info: probe::ProbeInfo) -> LinkInfo {
+    LinkInfo {
+        file_name: info.file_name.map(|name| filename::sanitize(&name)),
+        total: info.total,
+        resumable: info.resumable,
+        page: info.html,
     }
 }

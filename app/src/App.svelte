@@ -46,6 +46,7 @@
   import SettingsDialog from "./lib/SettingsDialog.svelte";
   import SpeedLimitDialog from "./lib/SpeedLimitDialog.svelte";
   import UrlDialog from "./lib/UrlDialog.svelte";
+  import UpdateDialog from "./lib/UpdateDialog.svelte";
   import { clock } from "./lib/clock.svelte";
   import { COLUMNS, columns } from "./lib/columns.svelte";
   import { detailsPanel } from "./lib/detailsPanel.svelte";
@@ -82,9 +83,13 @@
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let toast = $state("");
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
-  /** A newer version found when the app started. */
+  /** How often to look for an update while the app stays open. */
+  const UPDATE_CHECK_EVERY = 6 * 60 * 60 * 1000;
+  /** A newer version, found at start, when the connection came back, or in the regular check. */
   let update = $state<UpdateInfo | null>(null);
-  let installing = $state(false);
+  /** Whether the update dialog shows. "Later" keeps it closed for that version until the next start. */
+  let updateOpen = $state(false);
+  let laterFor: string | null = null;
 
   let visible = $derived(downloads.sorted.filter((item) => inView(view, item)));
   let currentQueue = $derived.by(() => {
@@ -138,13 +143,14 @@
     const unlistenActions = onFinishActions((a) => (finishActions = a));
     const unlistenCountdown = onFinishCountdown((c) => (countdown = c));
     api.finishActions().then((a) => (finishActions = a)).catch(showError);
-    // Quietly: being offline is no reason to bother anyone at start.
-    api
-      .prefs()
-      .then((p) => (p.checkUpdates ? api.checkUpdate() : null))
-      .then((u) => (update = u))
-      .catch(() => {});
+    checkForUpdate();
+    // Offline at start, the check runs again once the connection returns; and while the app
+    // stays open, as it does in the tray, every few hours.
+    window.addEventListener("online", checkForUpdate);
+    const updateTimer = setInterval(checkForUpdate, UPDATE_CHECK_EVERY);
     return () => {
+      window.removeEventListener("online", checkForUpdate);
+      clearInterval(updateTimer);
       disconnect.then((f) => f());
       unlistenBrowser.then((f) => f());
       unlistenAbout.then((f) => f());
@@ -153,14 +159,23 @@
     };
   });
 
-  async function installUpdate() {
-    installing = true;
+  /** Asks GitHub for a newer version, quietly: being offline is no reason to bother anyone. */
+  async function checkForUpdate() {
+    if (updateOpen) return;
     try {
-      await api.installUpdate();
-    } catch (err) {
-      installing = false;
-      showError(`Couldn't install the update: ${err}`);
+      if (!(await api.prefs()).checkUpdates) return;
+      const found = await api.checkUpdate();
+      if (!found) return;
+      update = found;
+      updateOpen = found.version !== laterFor;
+    } catch {
+      // Tried again when the connection returns, or at the next regular check.
     }
+  }
+
+  function closeUpdate() {
+    updateOpen = false;
+    laterFor = update?.version ?? null;
   }
 
   function showError(err: unknown) {
@@ -849,12 +864,8 @@ When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
 {#if removing}
   <RemoveDialog items={removing} onclose={() => (removing = null)} />
 {/if}
-{#if update && !toast}
-  <div class="toast" role="status">
-    <span>{installing ? "Downloading the update…" : `InternetBlazer ${update.version} is available.`}</span>
-    <button class="primary" onclick={installUpdate} disabled={installing}>Install and restart</button>
-    <button class="icon" onclick={() => (update = null)} aria-label="Later"><Icon name="close" size={16} /></button>
-  </div>
+{#if update && updateOpen}
+  <UpdateDialog {update} onclose={closeUpdate} />
 {/if}
 {#if toast}
   <div class="toast" role="alert">

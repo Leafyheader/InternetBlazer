@@ -11,6 +11,7 @@ aes.workspace = true
 cbc.workspace = true
 chrono.workspace = true
 fastrand.workspace = true
+bytes.workspace = true
 futures-util.workspace = true
 httpdate.workspace = true
 parking_lot.workspace = true

@@ -43,7 +43,7 @@ const MAX_FRAGMENT_CONNECTIONS: usize = 8;
 /// Finds the videos on a page with `yt-dlp -J`, which prints what it found as JSON.
 pub(crate) async fn inspect(
     ytdlp: &Path,
-    tools_dir: Option<&Path>,
+    tools_dir: tools::Dirs<'_>,
     ffmpeg: bool,
     url: &str,
     headers: &[(String, String)],
@@ -500,7 +500,7 @@ pub(crate) async fn execute(
     inner.save_running(record)?;
     inner.emit(Event::StatusChanged { id: record.id, status: record.status, error: None });
 
-    let tools_dir = inner.config.tools_dir.as_deref();
+    let tools_dir = inner.config.tool_dirs();
     let (ytdlp, _) = tools::ytdlp(tools_dir).ok_or(Error::NoYtdlp)?;
     let ffmpeg = tools::ffmpeg(tools_dir);
     loop {
@@ -530,7 +530,7 @@ async fn attempt(
         .connections
         .unwrap_or_else(|| inner.connections())
         .clamp(1, MAX_FRAGMENT_CONNECTIONS);
-    let mut cmd = tools::ytdlp_command(ytdlp, cfg.tools_dir.as_deref());
+    let mut cmd = tools::ytdlp_command(ytdlp, cfg.tool_dirs());
     cmd.args(args(record, format, ffmpeg, limit, connections))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

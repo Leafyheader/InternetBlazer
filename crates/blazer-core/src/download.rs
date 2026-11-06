@@ -25,14 +25,16 @@ use crate::{
     error::{Error, Result},
     filename, fsio,
     limit::RateLimiter,
-    media, probe,
+    media,
+    prefetch::{Body, Prefetch},
+    probe,
     segment::{Claim, Plan},
-    sniff, stream,
+    sniff,
+    speed::SpeedMeter,
+    stream,
     types::{self, DownloadId, DownloadRecord, Event, Progress, Retry, Status},
 };
 
-/// Weight of the newest sample in the smoothed speed.
-const SPEED_SMOOTHING: f64 = 0.3;
 /// Caps the exponential retry backoff at `retry_delay * 2^5`.
 const MAX_BACKOFF_SHIFT: u32 = 5;
 /// Longest server-requested `Retry-After` delay that is honored.
@@ -67,6 +69,11 @@ const STARVED_HOLD: Duration = Duration::from_secs(3);
 struct Shared {
     client: reqwest::Client,
     url: String,
+    /// Where requests go: the link, or where it was last seen to redirect to.
+    target: Mutex<String>,
+    /// The response that probed the file, still arriving, for the connection that starts at
+    /// the beginning: see `prefetch.rs`.
+    early: Mutex<Option<Prefetch>>,
     headers: Vec<(String, String)>,
     /// Sent as `If-Range`, so a changed file yields a full 200 response instead of
     /// mismatched bytes.
@@ -239,7 +246,12 @@ async fn execute(
     if let Some(total) = record.total {
         check_space(record, &part, total)?;
     }
-    if resume {
+    let attached = inner.prefetches.lock().take_download(record.id);
+    // It holds the file's start, which a resumed download has already.
+    let early = attached.filter(|p| {
+        !resume && p.info.total == record.total && p.info.resumable == record.resumable
+    });
+    let target = if resume {
         let info = tokio::select! {
             info = probe::probe(&inner.client, &record.url, &record.headers) => info?,
             () = cancel.cancelled() => return Ok(false),
@@ -249,9 +261,11 @@ async fn execute(
         {
             return Err(Error::RemoteChanged);
         }
+        info.url
     } else {
         record.segments.clear();
-    }
+        early.as_ref().and_then(|p| p.info.url.clone())
+    };
 
     let total = record.total;
     let file = tokio::task::spawn_blocking(move || fsio::open_part(&part, total, resume))
@@ -277,6 +291,8 @@ async fn execute(
     let shared = Arc::new(Shared {
         client: inner.client.clone(),
         url: record.url.clone(),
+        target: Mutex::new(target.unwrap_or_else(|| record.url.clone())),
+        early: Mutex::new(early),
         headers: record.headers.clone(),
         validator: probe::if_range(record.etag.as_deref(), record.last_modified.as_deref()),
         total: record.total,
@@ -517,6 +533,90 @@ async fn next_claim(sh: &Shared) -> Option<Claim> {
     }
 }
 
+/// Asks for `[first, end)` of the file, or for all of it if the server takes no ranges, and
+/// checks that the answer is what was asked for. `None` if the download stopped meanwhile.
+///
+/// Once a request has been redirected, later ones go straight to where it led, which saves each
+/// new connection a round trip to the first server, as GitHub's downloads have. If that address
+/// stops working, as signed addresses do after a while, they go back to the link.
+async fn open(
+    sh: &Shared,
+    first: u64,
+    end: u64,
+    cut: &CancellationToken,
+) -> Result<Option<reqwest::Response>> {
+    let target = sh.target.lock().clone();
+    let Some(mut resp) = send(sh, &target, first, end, cut).await? else { return Ok(None) };
+    if target != sh.url && resp.status().is_client_error() {
+        tracing::debug!(status = %resp.status(), "redirect target stopped working; using the link");
+        *sh.target.lock() = sh.url.clone();
+        let Some(again) = send(sh, &sh.url, first, end, cut).await? else { return Ok(None) };
+        resp = again;
+    }
+    let status = resp.status();
+    if sh.ranged {
+        match status {
+            StatusCode::PARTIAL_CONTENT => {}
+            StatusCode::OK if sh.validator.is_some() => return Err(Error::RemoteChanged),
+            StatusCode::OK => return Err(Error::RangeIgnored),
+            status => return Err(Error::from_response(status, resp.headers())),
+        }
+        // Bytes from the wrong place, or from a file of another size, would corrupt the file.
+        let Some(range) = probe::content_range(resp.headers()) else {
+            return Err(Error::MalformedRange);
+        };
+        if range.total.is_some() && range.total != sh.total {
+            return Err(Error::RemoteChanged);
+        }
+        if range.start != Some(first) {
+            return Err(Error::RangeIgnored);
+        }
+    } else if !status.is_success() {
+        return Err(Error::from_response(status, resp.headers()));
+    }
+    if resp.url().as_str() != target {
+        *sh.target.lock() = resp.url().to_string();
+    }
+    Ok(Some(resp))
+}
+
+async fn send(
+    sh: &Shared,
+    url: &str,
+    first: u64,
+    end: u64,
+    cut: &CancellationToken,
+) -> Result<Option<reqwest::Response>> {
+    let mut req = probe::request(&sh.client, url, &headers_for(&sh.url, url, &sh.headers));
+    if sh.ranged {
+        req = req.header(header::RANGE, format!("bytes={first}-{}", end - 1));
+        if let Some(validator) = &sh.validator {
+            req = req.header(header::IF_RANGE, validator);
+        }
+    }
+    tokio::select! {
+        resp = req.send() => Ok(Some(resp?)),
+        () = sh.stop.cancelled() => Ok(None),
+        () = cut.cancelled() => Ok(None),
+    }
+}
+
+/// The headers to send to `target` for the link `url`. A redirect to another host drops the
+/// ones that sign the user in, as the HTTP client does when it follows redirects itself, so going
+/// straight there must drop them too.
+fn headers_for(url: &str, target: &str, headers: &[(String, String)]) -> Vec<(String, String)> {
+    let host = |u: &str| url::Url::parse(u).ok().and_then(|u| u.host_str().map(str::to_owned));
+    if host(url) == host(target) {
+        return headers.to_vec();
+    }
+    const PRIVATE: [&str; 3] = ["cookie", "authorization", "proxy-authorization"];
+    headers
+        .iter()
+        .filter(|(name, _)| !PRIVATE.contains(&name.to_ascii_lowercase().as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Reads `len` bytes of the file at `offset` back from disk.
 async fn read_back(file: &Arc<File>, offset: u64, len: u64) -> Result<Vec<u8>> {
     if len == 0 {
@@ -543,52 +643,44 @@ async fn fetch(
     buf: &mut Vec<u8>,
     failures: &mut u32,
 ) -> Result<()> {
+    let mut writer = Writer { offset: claim.from, pending: None };
+    let result = fetch_into(sh, claim, buf, failures, &mut writer).await;
+    // The write still under way holds bytes accepted before whatever ended the transfer. It
+    // must land and count before the segment goes back to the plan, or another connection could
+    // fetch the same bytes while it is still being written.
+    let settled = writer.settle(sh).await;
+    result.and(settled.map(drop))
+}
+
+async fn fetch_into(
+    sh: &Shared,
+    claim: &mut Claim,
+    buf: &mut Vec<u8>,
+    failures: &mut u32,
+    writer: &mut Writer,
+) -> Result<()> {
     let (overlap, mut cut) = {
         let plan = sh.plan.lock();
         (plan.overlap(claim), plan.stopper(claim))
     };
     let expected = read_back(&sh.file, claim.from - overlap, overlap).await?;
     let first = claim.from - overlap;
-    let mut req = probe::request(&sh.client, &sh.url, &sh.headers);
-    if sh.ranged {
-        req = req.header(header::RANGE, format!("bytes={first}-{}", claim.end - 1));
-        if let Some(validator) = &sh.validator {
-            req = req.header(header::IF_RANGE, validator);
-        }
-    }
-    let resp = tokio::select! {
-        resp = req.send() => resp?,
-        () = sh.stop.cancelled() => return Ok(()),
-        () = cut.cancelled() => return Ok(()),
+    // The download's first connection may already be under way: see `prefetch.rs`.
+    let early = match first == 0 && !claim.racing {
+        true => sh.early.lock().take(),
+        false => None,
     };
-    let status = resp.status();
-    if sh.ranged {
-        match status {
-            StatusCode::PARTIAL_CONTENT => {}
-            StatusCode::OK if sh.validator.is_some() => return Err(Error::RemoteChanged),
-            StatusCode::OK => return Err(Error::RangeIgnored),
-            status => return Err(Error::from_response(status, resp.headers())),
+    let (mut stream, requested): (Body, u64) = match early {
+        // It asked for the whole file from its start.
+        Some(early) => (early.into_body().await, sh.total.unwrap_or(u64::MAX)),
+        None => {
+            let Some(resp) = open(sh, first, claim.end, &cut).await? else { return Ok(()) };
+            // What this response may hold. The claim can shrink while it runs, when another
+            // connection takes over its end, but the request cannot.
+            (Box::pin(resp.bytes_stream()), claim.end - first)
         }
-        // Bytes from the wrong place, or from a file of another size, would corrupt the file.
-        let Some(range) = probe::content_range(resp.headers()) else {
-            return Err(Error::MalformedRange);
-        };
-        if range.total.is_some() && range.total != sh.total {
-            return Err(Error::RemoteChanged);
-        }
-        if range.start != Some(first) {
-            return Err(Error::RangeIgnored);
-        }
-    } else if !status.is_success() {
-        return Err(Error::from_response(status, resp.headers()));
-    }
-
+    };
     let _connection = ConnectionGuard::new(&sh.connections);
-    let mut stream = resp.bytes_stream();
-    let mut offset = claim.from;
-    // What this response may hold. The claim can shrink while it runs, when another
-    // connection takes over its end, but the request cannot.
-    let requested = claim.end - first;
     let mut body = 0u64;
     // Overlap bytes checked so far.
     let mut checked = 0;
@@ -599,14 +691,8 @@ async fn fetch(
     loop {
         let next = tokio::select! {
             biased;
-            () = sh.stop.cancelled() => {
-                flush(sh, claim.idx, offset, buf).await?;
-                return Ok(());
-            }
-            () = cut.cancelled() => {
-                flush(sh, claim.idx, offset, buf).await?;
-                return Ok(());
-            }
+            () = sh.stop.cancelled() => return writer.submit(sh, claim.idx, buf).await,
+            () = cut.cancelled() => return writer.submit(sh, claim.idx, buf).await,
             next = stream.next() => next,
         };
         match next {
@@ -659,7 +745,7 @@ async fn fetch(
                 }
                 let now = std::time::Instant::now();
                 let (take, done) = sh.plan.lock().reserve(claim.idx, chunk.len(), now);
-                let pos = offset + buf.len() as u64;
+                let pos = writer.offset + buf.len() as u64;
                 if sh.ranged && pos < HEAD_LEN as u64 {
                     let mut head = sh.head.lock();
                     if head.len() as u64 == pos {
@@ -673,14 +759,14 @@ async fn fetch(
                     sh.received.fetch_add(take as u64, Ordering::Relaxed);
                 }
                 if done || buf.len() >= sh.write_buffer {
-                    offset = flush(sh, claim.idx, offset, buf).await?;
+                    writer.submit(sh, claim.idx, buf).await?;
                 }
                 let stopped = tokio::select! {
                     () = sh.throttle(take) => false,
                     () = sh.stop.cancelled() => true,
                 };
                 if done || stopped {
-                    flush(sh, claim.idx, offset, buf).await?;
+                    writer.submit(sh, claim.idx, buf).await?;
                     if done && sh.ranged && body == requested {
                         return check_ended(sh, &mut stream).await;
                     }
@@ -688,11 +774,13 @@ async fn fetch(
                 }
             }
             Some(Err(e)) => {
-                flush(sh, claim.idx, offset, buf).await?;
+                writer.submit(sh, claim.idx, buf).await?;
                 return Err(e.into());
             }
             None => {
-                flush(sh, claim.idx, offset, buf).await?;
+                // Ending an unbounded segment needs all of it counted.
+                writer.submit(sh, claim.idx, buf).await?;
+                writer.settle(sh).await?;
                 let mut plan = sh.plan.lock();
                 return match plan.is_unbounded(claim.idx) {
                     true => {
@@ -801,22 +889,51 @@ impl Shared {
     }
 }
 
-/// Writes the buffered bytes at `offset` and marks them downloaded. Returns the next offset.
-async fn flush(sh: &Shared, idx: usize, offset: u64, buf: &mut Vec<u8>) -> Result<u64> {
-    if buf.is_empty() {
-        return Ok(offset);
+/// Writes one connection's data while it goes on receiving: one buffer fills from the network
+/// while the other is written. A connection that waited for each write would leave its data
+/// unread in the meantime, and a slow disk, or a checkpoint flushing it, would then show up as
+/// a dip in download speed.
+struct Writer {
+    /// Where the next write goes.
+    offset: u64,
+    pending: Option<PendingWrite>,
+}
+
+struct PendingWrite {
+    idx: usize,
+    len: u64,
+    task: tokio::task::JoinHandle<io::Result<Vec<u8>>>,
+}
+
+impl Writer {
+    /// Starts writing the buffered bytes of segment `idx`, after the previous write ends. `buf`
+    /// gets back an empty buffer to go on filling.
+    async fn submit(&mut self, sh: &Shared, idx: usize, buf: &mut Vec<u8>) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let spare = self.settle(sh).await?.unwrap_or_else(|| Vec::with_capacity(sh.write_buffer));
+        let data = std::mem::replace(buf, spare);
+        let (file, offset, len) = (sh.file.clone(), self.offset, data.len() as u64);
+        let task = tokio::task::spawn_blocking(move || {
+            fsio::write_at(&file, &data, offset).map(|()| data)
+        });
+        self.offset += len;
+        self.pending = Some(PendingWrite { idx, len, task });
+        Ok(())
     }
-    let data = std::mem::take(buf);
-    let file = sh.file.clone();
-    let data =
-        tokio::task::spawn_blocking(move || fsio::write_at(&file, &data, offset).map(|()| data))
-            .await
-            .map_err(Error::internal)??;
-    let len = data.len() as u64;
-    sh.plan.lock().commit(idx, len);
-    *buf = data;
-    buf.clear();
-    Ok(offset + len)
+
+    /// Waits for the write under way, if any, and marks its bytes downloaded. Returns its
+    /// buffer, emptied, for reuse.
+    async fn settle(&mut self, sh: &Shared) -> Result<Option<Vec<u8>>> {
+        let Some(PendingWrite { idx, len, task }) = self.pending.take() else {
+            return Ok(None);
+        };
+        let mut data = task.await.map_err(Error::internal)??;
+        sh.plan.lock().commit(idx, len);
+        data.clear();
+        Ok(Some(data))
+    }
 }
 
 /// Emits progress events and periodically checkpoints until `stop` fires.
@@ -830,8 +947,7 @@ async fn report(
     let mut ticker = time::interval(cfg.progress_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_checkpoint = Instant::now();
-    let mut last_sample = (Instant::now(), shared.plan.lock().downloaded());
-    let mut speed = 0.0;
+    let mut meter = SpeedMeter::new(Instant::now(), shared.received.load(Ordering::Relaxed));
     let mut received = 0;
     let mut last_data = Instant::now();
     loop {
@@ -844,16 +960,8 @@ async fn report(
             (plan.downloaded(), plan.segments())
         };
         let now = Instant::now();
-        let elapsed = now.duration_since(last_sample.0).as_secs_f64();
-        if elapsed > 0.0 {
-            let sample = downloaded.saturating_sub(last_sample.1) as f64 / elapsed;
-            speed = match speed == 0.0 {
-                true => sample,
-                false => SPEED_SMOOTHING * sample + (1.0 - SPEED_SMOOTHING) * speed,
-            };
-        }
-        last_sample = (now, downloaded);
         let now_received = shared.received.load(Ordering::Relaxed);
+        let speed = meter.sample(now, now_received);
         if now_received != received || shared.throttled.load(Ordering::Relaxed) > 0 {
             received = now_received;
             last_data = now;
@@ -865,7 +973,7 @@ async fn report(
             id: record.id,
             downloaded,
             total: record.total,
-            speed: speed as u64,
+            speed,
             connections: shared.connections.load(Ordering::Relaxed),
             planned: shared.planned,
             refused: shared.refused.load(Ordering::Relaxed),
@@ -914,5 +1022,24 @@ impl<'a> ConnectionGuard<'a> {
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_in_headers_stay_with_the_links_host() {
+        let headers = vec![
+            ("Cookie".to_owned(), "session=1".to_owned()),
+            ("authorization".to_owned(), "Bearer x".to_owned()),
+            ("Referer".to_owned(), "https://example.com/".to_owned()),
+        ];
+        let link = "https://example.com/get/file.zip";
+        let same = headers_for(link, "https://example.com/files/file.zip?sig=1", &headers);
+        assert_eq!(same, headers);
+        let other = headers_for(link, "https://cdn.example.net/file.zip?sig=1", &headers);
+        assert_eq!(other, vec![("Referer".to_owned(), "https://example.com/".to_owned())]);
     }
 }

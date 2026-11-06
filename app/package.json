@@ -6,10 +6,12 @@
   "license": "MIT OR Apache-2.0",
   "scripts": {
     "dev": "vite",
+    "dev:host": "cargo build -p blazer-host",
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
-    "package": "tauri build --config src-tauri/tauri.release.conf.json",
+    "package": "tauri build --config src-tauri/tauri.release.conf.json --config src-tauri/tauri.full.conf.json",
+    "package:update": "tauri build --config src-tauri/tauri.release.conf.json",
     "pack-extension": "node scripts/pack-extension.mjs"
   },
   "devDependencies": {
