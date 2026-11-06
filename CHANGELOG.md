@@ -3,7 +3,7 @@
 Each release's section is what the update dialog in the app and the GitHub release show. Write each
 item on one line: the app shows them as plain text, so a wrapped line would break there too.
 
-## 0.3.1
+## 0.3.2
 
 - Linux: .deb and .rpm packages, which update themselves like the Windows app.
 - Settings lists your browsers: untick one to leave its downloads to the browser.
