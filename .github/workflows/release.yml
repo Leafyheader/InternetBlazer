@@ -80,12 +80,12 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # Into one folder: the upload keeps the folders under the paths' common parent.
+      - run: mkdir release && mv target/release/bundle/deb/*.deb* target/release/bundle/rpm/*.rpm* release/
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: |
-            target/release/bundle/deb/*.deb*
-            target/release/bundle/rpm/*.rpm*
+          path: release/
           if-no-files-found: error
 
   release:
