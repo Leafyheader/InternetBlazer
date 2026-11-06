@@ -1186,8 +1186,10 @@ async fn a_new_address_for_the_same_file_keeps_the_progress() {
     let engine = open(tmp.path());
 
     let id = engine.add(NewDownload::new(&old_url, tmp.path())).await.unwrap();
-    pause_after(&engine, id, size as u64 / 2).await;
+    // Early, so a loaded runner does not finish the rest before the pause lands.
+    pause_after(&engine, id, size as u64 / 4).await;
     let paused = engine.wait(id).await.unwrap();
+    assert_eq!(paused.status, Status::Paused, "finished before the pause");
 
     let err = engine.set_url(id, &other_url).await.unwrap_err();
     assert!(err.to_string().contains("different file"), "{err}");
