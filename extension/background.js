@@ -24,6 +24,26 @@ function fileExtension(name) {
   return /\.([a-z0-9]{1,10})$/i.exec(name)?.[1].toLowerCase() ?? "";
 }
 
+/** The app's answer to whether it takes this browser's downloads, kept for a short while. */
+let captureAnswer = { at: 0, capture: true };
+const CAPTURE_KEPT_MS = 30_000;
+
+/**
+ * Whether the app's settings have it take downloads from this browser. Asked of the host, which
+ * knows the browser and reads the setting even while the app isn't running.
+ */
+async function appCaptures() {
+  if (Date.now() - captureAnswer.at < CAPTURE_KEPT_MS) return captureAnswer.capture;
+  try {
+    const reply = await chrome.runtime.sendNativeMessage(HOST, { type: "ping" });
+    captureAnswer = { at: Date.now(), capture: reply?.capture !== false };
+  } catch {
+    // Without the host the app can't take it either; handOver leaves it to the browser then.
+    return true;
+  }
+  return captureAnswer.capture;
+}
+
 async function shouldTake(item, name) {
   const url = item.finalUrl || item.url;
   // Private windows stay private: nothing from them goes into the app's list.
@@ -32,7 +52,8 @@ async function shouldTake(item, name) {
   const settings = await loadSettings();
   return (
     settings.enabled &&
-    parseFileTypes(settings.fileTypes).has(fileExtension(name || nameFromUrl(url)))
+    parseFileTypes(settings.fileTypes).has(fileExtension(name || nameFromUrl(url))) &&
+    (await appCaptures())
   );
 }
 

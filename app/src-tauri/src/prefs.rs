@@ -36,6 +36,8 @@ pub struct Prefs {
     pub check_updates: bool,
     /// Whether the user has been told that closing the window hides it.
     pub tray_notice_shown: bool,
+    /// Whether the user has been offered to put the extension into their browsers.
+    pub browser_setup_shown: bool,
 }
 
 impl Default for Prefs {
@@ -51,6 +53,7 @@ impl Default for Prefs {
             notify: true,
             check_updates: true,
             tray_notice_shown: false,
+            browser_setup_shown: false,
         }
     }
 }

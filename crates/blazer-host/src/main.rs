@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blazer_host::{BrowserDownload, Request, Response};
+use blazer_host::{BrowserDownload, Request, Response, browsers};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -69,12 +69,19 @@ fn install() -> io::Result<()> {
 fn serve() -> io::Result<()> {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
+    let browser = browsers::calling_browser();
+    if let Some(browser) = browser {
+        browsers::mark_seen(browser.id);
+    }
     while let Some(message) = read_message(&mut stdin)? {
         let reply = match serde_json::from_slice::<Message>(&message) {
             Ok(Message::Ping) => json!({
                 "ok": true,
                 "version": env!("CARGO_PKG_VERSION"),
                 "appRunning": blazer_host::is_running(),
+                "browser": browser.map(|b| b.id),
+                // Whether this browser's downloads go to the app, as set in the app.
+                "capture": browser.is_none_or(|b| browsers::captures(b.id)),
             }),
             Ok(Message::Download(download)) => {
                 allow_focus();

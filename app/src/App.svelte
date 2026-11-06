@@ -7,6 +7,7 @@
   import {
     api,
     type Category,
+    type Browser,
     type Countdown,
     FINISH_LABELS,
     type FinishAction,
@@ -47,6 +48,7 @@
   import SpeedLimitDialog from "./lib/SpeedLimitDialog.svelte";
   import UrlDialog from "./lib/UrlDialog.svelte";
   import UpdateDialog from "./lib/UpdateDialog.svelte";
+  import BrowserSetupDialog from "./lib/BrowserSetupDialog.svelte";
   import { clock } from "./lib/clock.svelte";
   import { COLUMNS, columns } from "./lib/columns.svelte";
   import { detailsPanel } from "./lib/detailsPanel.svelte";
@@ -71,6 +73,8 @@
   /** The download whose address is being changed. */
   let urlDialog = $state<Item | null>(null);
   let settingsOpen = $state(false);
+  /** The browsers offered the extension on first start, until the user answers. */
+  let browserSetup = $state<Browser[] | null>(null);
   let aboutOpen = $state(false);
   /** What each queue does the next time it finishes. */
   let finishActions = $state<Record<number, FinishAction>>({});
@@ -144,6 +148,7 @@
     const unlistenCountdown = onFinishCountdown((c) => (countdown = c));
     api.finishActions().then((a) => (finishActions = a)).catch(showError);
     checkForUpdate();
+    offerExtension();
     // Offline at start, the check runs again once the connection returns; and while the app
     // stays open, as it does in the tray, every few hours.
     window.addEventListener("online", checkForUpdate);
@@ -160,6 +165,17 @@
   });
 
   /** Asks GitHub for a newer version, quietly: being offline is no reason to bother anyone. */
+  /** Once, offers to add the extension to the browsers it can go into and isn't in yet. */
+  async function offerExtension() {
+    try {
+      if ((await api.prefs()).browserSetupShown) return;
+      const browsers = await api.browsers();
+      if (browsers.some((b) => b.canInstall && !b.connected)) browserSetup = browsers;
+    } catch {
+      // Offered again next start.
+    }
+  }
+
   async function checkForUpdate() {
     if (updateOpen) return;
     try {
@@ -866,6 +882,9 @@ When done: ${FINISH_LABELS[finishActions[q.id]]}` : "")
 {/if}
 {#if update && updateOpen}
   <UpdateDialog {update} onclose={closeUpdate} />
+{/if}
+{#if browserSetup}
+  <BrowserSetupDialog browsers={browserSetup} onclose={() => (browserSetup = null)} />
 {/if}
 {#if toast}
   <div class="toast" role="alert">

@@ -9,9 +9,12 @@ async function showStatus() {
   try {
     const reply = await chrome.runtime.sendNativeMessage(HOST, { type: "ping" });
     status.className = "status ok";
-    text = reply.appRunning
-      ? "Connected to InternetBlazer"
-      : "Ready. InternetBlazer opens when a download arrives.";
+    text =
+      reply.capture === false
+        ? "InternetBlazer is set to leave this browser's downloads alone. Turn it on in the app's Settings."
+        : reply.appRunning
+          ? "Connected to InternetBlazer"
+          : "Ready. InternetBlazer opens when a download arrives.";
   } catch {
     status.className = "status bad";
     text = "InternetBlazer is not set up. Open the app once, then reopen this popup.";

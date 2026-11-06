@@ -1,8 +1,9 @@
 name: Release
 
-# Pushing a tag such as v0.2.0 builds the full installer and the smaller update installer, and
-# drafts a release with both and latest.json. Publishing the draft makes it the update that
-# installed copies pick up.
+# Pushing a tag such as v0.2.0 builds the Windows installers and the Linux packages, and drafts a
+# release with them and latest.json. Publishing the draft makes it the update that installed
+# copies pick up: Windows ones download the lean update installer, Linux ones the same package
+# people download.
 on:
   push:
     tags: ["v*"]
@@ -10,8 +11,6 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +36,7 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           mkdir -p release
           for ext in "" ".sig"; do
-            mv "target/release/bundle/nsis/InternetBlazer_${v}_x64-setup.exe$ext"               "release/InternetBlazer_${v}_x64-update.exe$ext"
+            mv "target/release/bundle/nsis/InternetBlazer_${v}_x64-setup.exe$ext" "release/InternetBlazer_${v}_x64-update.exe$ext"
           done
       # The installer people download: the app with yt-dlp, deno and ffmpeg, so videos work
       # without fetching anything.
@@ -47,12 +46,67 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-      - name: Point latest.json at the update
-        run: node app/scripts/latest-json.mjs "${{ github.ref_name }}" release
-      - name: Draft the release
+      - run: mv "target/release/bundle/nsis/InternetBlazer_${GITHUB_REF_NAME#v}_x64-setup.exe" release/
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: release/
+          if-no-files-found: error
+
+  # Debian/Ubuntu and Fedora/openSUSE packages. They hold the app and blazer-host; the app fetches
+  # yt-dlp and deno, and uses the system's ffmpeg. Each package and its .sig is also the update. Built on the oldest supported Ubuntu, so the
+  # packages run on older systems too.
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux libraries
         run: |
-          v="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" --draft             --title "InternetBlazer $GITHUB_REF_NAME"             --notes "See the commits since the last release for what changed."             "target/release/bundle/nsis/InternetBlazer_${v}_x64-setup.exe"             "release/InternetBlazer_${v}_x64-update.exe"             release/latest.json
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+        working-directory: app
+      - name: Build the packages
+        run: npm run package:update -- --bundles deb,rpm
+        working-directory: app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            target/release/bundle/deb/*.deb*
+            target/release/bundle/rpm/*.rpm*
+          if-no-files-found: error
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      # latest.json and the release text both take the version's section of CHANGELOG.md.
+      - name: Write latest.json
+        run: node app/scripts/latest-json.mjs "$GITHUB_REF_NAME" release
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --repo "$GITHUB_REPOSITORY" \
+            --title "InternetBlazer $GITHUB_REF_NAME" \
+            --notes-file release/notes.md \
+            release/*.exe release/*.deb release/*.rpm release/latest.json

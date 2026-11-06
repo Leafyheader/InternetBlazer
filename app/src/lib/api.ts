@@ -186,7 +186,28 @@ export interface Prefs {
   notify: boolean;
   /** Looks for a newer version each time the app starts. */
   checkUpdates: boolean;
+  /** The user has been offered the extension for their browsers. */
+  browserSetupShown?: boolean;
 }
+
+/** A browser installed on this computer. */
+export interface Browser {
+  id: string;
+  name: string;
+  /** Its downloads go to the app. */
+  capture: boolean;
+  /** The extension has talked to the app from it. */
+  connected: boolean;
+  /** The app can put the extension into it, which needs the extension in its store. */
+  canInstall: boolean;
+  /** The store the extension comes from. */
+  store: string;
+  /** Installing takes effect at the browser's next start, rather than opening a store page. */
+  onRestart: boolean;
+}
+
+/** What installing the extension did. */
+export type ExtensionInstalled = "onRestart" | "pageOpened";
 
 export type Category = "video" | "music" | "compressed" | "documents" | "programs" | "other";
 
@@ -324,6 +345,10 @@ export const api = {
   setPrefs: (prefs: Prefs) => invoke<void>("set_prefs", { new: prefs }),
   launchAtLogin: () => invoke<boolean>("get_launch_at_login"),
   setLaunchAtLogin: (enabled: boolean) => invoke<void>("set_launch_at_login", { enabled }),
+  browsers: () => invoke<Browser[]>("list_browsers"),
+  setBrowserCapture: (id: string, capture: boolean) => invoke<void>("set_browser_capture", { id, capture }),
+  installExtension: (id: string) => invoke<ExtensionInstalled>("install_extension", { id }),
+  browserSetupShown: () => invoke<void>("browser_setup_shown"),
   openLogFolder: () => invoke<void>("open_log_folder"),
   openProjectPage: (page: "home" | "releases" | "issues" | "license") =>
     invoke<void>("open_project_page", { page }),

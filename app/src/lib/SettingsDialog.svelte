@@ -1,7 +1,8 @@
 <script lang="ts">
   import { open as pickFolder } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import { api, type Category, type MediaTools, type Prefs, type Settings } from "./api";
+  import { api, type Browser, type Category, type MediaTools, type Prefs, type Settings } from "./api";
+  import { installMessage } from "./browsers";
   import { downloads } from "./downloads.svelte";
   import Icon from "./Icon.svelte";
 
@@ -23,6 +24,11 @@
   let updatingDeno = $state(false);
   let denoMessage = $state("");
   let toolsMessage = $state("");
+  /** The browsers on this computer; capture changes are saved with the rest. */
+  let browsers = $state<Browser[]>([]);
+  let initialCapture: Record<string, boolean> = {};
+  let installing = $state("");
+  let browserMessage = $state("");
 
   onMount(() => {
     dialog.showModal();
@@ -35,7 +41,23 @@
       })
       .catch((err) => (error = String(err)));
     api.mediaTools().then((t) => (tools = t));
+    api.browsers().then((list) => {
+      browsers = list;
+      initialCapture = Object.fromEntries(list.map((b) => [b.id, b.capture]));
+    });
   });
+
+  async function addExtension(browser: Browser) {
+    installing = browser.id;
+    browserMessage = "";
+    try {
+      browserMessage = installMessage(browser, await api.installExtension(browser.id));
+    } catch (err) {
+      browserMessage = `${browser.name}: ${err}`;
+    } finally {
+      installing = "";
+    }
+  }
 
   async function updateYtdlp() {
     updating = true;
@@ -116,6 +138,9 @@
         autoRetries: Math.min(100, Math.max(0, Math.round(settings.autoRetries ?? 10))),
       });
       if (launchAtLogin !== initialLaunch) await api.setLaunchAtLogin(launchAtLogin);
+      for (const b of browsers.filter((b) => b.capture !== initialCapture[b.id])) {
+        await api.setBrowserCapture(b.id, b.capture);
+      }
       dialog.close();
     } catch (err) {
       error = String(err);
@@ -244,15 +269,41 @@
             </p>
           {:else}
             <p class="hint warn">
-              ffmpeg isn't installed. Without it, YouTube and many other sites offer only the sound or
-              low qualities. On Windows, install it with: winget install ffmpeg
+              ffmpeg isn't installed yet. InternetBlazer fetches it in the background while it's online;
+              until then, YouTube and many other sites offer only the sound or low qualities.
             </p>
           {/if}
         {/if}
       </fieldset>
 
       <fieldset>
-        <legend>Browser</legend>
+        <legend>Browsers</legend>
+        {#if browsers.length}
+          <span>Capture downloads from these browsers</span>
+          {#each browsers as b (b.id)}
+            <div class="inline">
+              <label class="check grow">
+                <input type="checkbox" bind:checked={b.capture} />
+                {b.name}
+                {#if b.connected}<span class="muted">· extension added</span>{/if}
+              </label>
+              {#if !b.connected}
+                <button
+                  type="button"
+                  onclick={() => addExtension(b)}
+                  disabled={!b.canInstall || installing !== ""}
+                  title={b.canInstall ? undefined : `The extension isn't in the ${b.store} yet`}
+                >
+                  {installing === b.id ? "Adding…" : "Add extension"}
+                </button>
+              {/if}
+            </div>
+          {/each}
+          <p class="hint muted" aria-live="polite">
+            {browserMessage ||
+              "Unticked browsers keep their downloads; links you send with the right-click menu still come here."}
+          </p>
+        {/if}
         <label class="check">
           <input type="checkbox" bind:checked={prefs.confirmBrowserDownloads} />
           Ask before downloading from the browser
@@ -287,7 +338,7 @@
           Check for updates when the app starts
         </label>
         <p class="hint muted">
-          A newer version shows a notice with an install button. To check now, open About.
+          A newer version shows a dialog to download it and restart. To check now, open About.
         </p>
       </fieldset>
     {:else if !error}

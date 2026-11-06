@@ -390,10 +390,41 @@ fn get_prefs(prefs: State<'_, PrefsStore>) -> Prefs {
 fn set_prefs(prefs: State<'_, PrefsStore>, new: Prefs) -> CmdResult<()> {
     prefs
         .update(|p| {
-            *p =
-                Prefs { last_dir: p.last_dir.take(), tray_notice_shown: p.tray_notice_shown, ..new }
+            *p = Prefs {
+                last_dir: p.last_dir.take(),
+                tray_notice_shown: p.tray_notice_shown,
+                browser_setup_shown: p.browser_setup_shown,
+                ..new
+            }
         })
         .map_err(|e| format!("{e:#}"))
+}
+
+/// The browsers on this computer, with whether the app captures their downloads.
+#[tauri::command]
+async fn list_browsers() -> CmdResult<Vec<blazer_host::browsers::BrowserState>> {
+    tauri::async_runtime::spawn_blocking(blazer_host::browsers::installed).await.map_err(message)
+}
+
+#[tauri::command]
+fn set_browser_capture(id: String, capture: bool) -> CmdResult<()> {
+    blazer_host::browsers::set_capture(&id, capture).map_err(message)
+}
+
+/// Puts the extension into a browser: the browser asks to turn it on at its next start, or its
+/// store page opens.
+#[tauri::command]
+async fn install_extension(id: String) -> CmdResult<blazer_host::browsers::Installed> {
+    tauri::async_runtime::spawn_blocking(move || blazer_host::browsers::install_extension(&id))
+        .await
+        .map_err(message)?
+        .map_err(message)
+}
+
+/// Remembers that the user was offered the extension for their browsers.
+#[tauri::command]
+fn browser_setup_shown(prefs: State<'_, PrefsStore>) -> CmdResult<()> {
+    prefs.update(|p| p.browser_setup_shown = true).map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -801,6 +832,10 @@ fn main() {
             set_prefs,
             get_launch_at_login,
             set_launch_at_login,
+            list_browsers,
+            set_browser_capture,
+            install_extension,
+            browser_setup_shown,
             open_log_folder,
             open_project_page,
             check_update,

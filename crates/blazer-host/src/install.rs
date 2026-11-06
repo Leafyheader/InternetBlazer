@@ -51,8 +51,10 @@ pub fn install(host_exe: &Path) -> io::Result<Vec<&'static str>> {
     platform::install(host_exe)
 }
 
-/// Removes the registrations made by [`install`].
+/// Removes the registrations made by [`install`], and the extension from the browsers the app put
+/// it into.
 pub fn uninstall() -> io::Result<()> {
+    crate::browsers::uninstall_extensions()?;
     platform::uninstall()
 }
 

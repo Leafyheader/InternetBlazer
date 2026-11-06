@@ -8,6 +8,7 @@
 //! The app serves the socket; this crate holds the protocol, the client and the code that
 //! registers the host with browsers.
 
+pub mod browsers;
 mod install;
 
 use std::{
