@@ -1,6 +1,6 @@
 # InternetBlazer
 
-A fast, open-source, cross-platform download manager written in Rust: an IDM alternative with a modern UI.
+A fast, open-source, cross-platform download manager written in Rust with a modern UI.
 
 > **Status:** Phase 5. The download engine, a CLI, the desktop app (with queues, a scheduler and speed limits), a browser extension and video downloads with yt-dlp work. Packaging comes next.
 
