@@ -4,6 +4,14 @@ A fast, open-source, cross-platform download manager written in Rust: an IDM alt
 
 > **Status:** Phase 5. The download engine, a CLI, the desktop app (with queues, a scheduler and speed limits), a browser extension and video downloads with yt-dlp work. Packaging comes next.
 
+<p align="center">
+  <img src="docs/images/downloads.png" alt="InternetBlazer's download list, with the sidebar of queues and file types" width="720">
+</p>
+
+<p align="center">
+  <img src="docs/images/about.png" alt="InternetBlazer's About dialog, with the version and the update check" width="520">
+</p>
+
 ## Features (engine)
 
 - **Segmented downloads.** Parallel HTTP range requests, with dynamic re-splitting: when a connection finishes, it takes half of the largest remaining segment, so no connection sits idle near the end.
